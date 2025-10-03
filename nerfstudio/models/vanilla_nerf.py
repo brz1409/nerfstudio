@@ -36,6 +36,7 @@ from nerfstudio.model_components.ray_samplers import VolumetricSampler
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
+from nerfstudio.utils.rich_utils import CONSOLE
 
 
 @dataclass
@@ -133,6 +134,17 @@ class NeRFModel(Model):
         self.sampler = VolumetricSampler(
             occupancy_grid=self.occupancy_grid,
             density_fn=self.field_fine.density_fn,
+        )
+        render_step = self.config.render_step_size
+        render_step_str = f"{render_step:.6f}" if render_step is not None else "auto"
+        CONSOLE.log(
+            "VanillaNeRF sampling uses nerfacc occupancy grid "
+            f"(render_step_size={render_step_str}, levels={self.config.grid_levels}, "
+            f"resolution={self.config.grid_resolution})."
+        )
+        CONSOLE.log(
+            "VanillaNeRF sampling uses nerfacc occupancy grid with render_step_size="
+            f"{self.config.render_step_size:.6f if self.config.render_step_size is not None else 'auto'}"
         )
 
         # renderers
