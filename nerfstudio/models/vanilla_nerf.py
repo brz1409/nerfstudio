@@ -38,6 +38,7 @@ from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils import writer as global_writer
+from nerfstudio.utils.writer import EventName as WriterEventName
 
 
 @dataclass
@@ -174,14 +175,16 @@ class NeRFModel(Model):
             # Log explicit nerfacc metrics to dashboards (WandB/TensorBoard/Local).
             try:
                 if hasattr(self, "_nerfacc_last_samples_sum"):
-                    global_writer.put_scalar(name="Nerfacc/Active", scalar=1.0, step=step)
+                    global_writer.put_scalar(name=WriterEventName.NERFACC_ACTIVE, scalar=1.0, step=step)
                     global_writer.put_scalar(
-                        name="Nerfacc/SamplesPerBatch", scalar=float(self._nerfacc_last_samples_sum), step=step
+                        name=WriterEventName.NERFACC_SAMPLES_PER_BATCH,
+                        scalar=float(self._nerfacc_last_samples_sum),
+                        step=step,
                     )
                 # Also expose render step size as a constant for convenience
                 if step == 0:
                     rstep = self.config.render_step_size if self.config.render_step_size is not None else -1.0
-                    global_writer.put_scalar(name="Nerfacc/RenderStepSize", scalar=float(rstep), step=0)
+                    global_writer.put_scalar(name=WriterEventName.NERFACC_RENDER_STEP_SIZE, scalar=float(rstep), step=0)
             except Exception:
                 # Best-effort logging: never break training due to logging
                 pass

@@ -57,6 +57,10 @@ class EventName(enum.Enum):
     TEST_RAYS_PER_SEC = "Test Rays / Sec"
     VIS_RAYS_PER_SEC = "Vis Rays / Sec"
     CURR_TEST_PSNR = "Test PSNR"
+    # nerfacc diagnostics (added)
+    NERFACC_ACTIVE = "Nerfacc Active"
+    NERFACC_SAMPLES_PER_BATCH = "Nerfacc Samples / Batch"
+    NERFACC_RENDER_STEP_SIZE = "Nerfacc Render Step Size"
 
 
 class EventType(enum.Enum):
