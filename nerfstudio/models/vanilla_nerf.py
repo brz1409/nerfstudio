@@ -87,8 +87,7 @@ class NeRFModel(Model):
         config: VanillaModelConfig,
         **kwargs,
     ) -> None:
-        self.field_coarse = None
-        self.field_fine = None
+        self.field = None
         self.temporal_distortion = None
 
         super().__init__(
@@ -108,12 +107,7 @@ class NeRFModel(Model):
             in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=4.0, include_input=True
         )
 
-        self.field_coarse = NeRFField(
-            position_encoding=position_encoding,
-            direction_encoding=direction_encoding,
-        )
-
-        self.field_fine = NeRFField(
+        self.field = NeRFField(
             position_encoding=position_encoding,
             direction_encoding=direction_encoding,
         )
@@ -130,10 +124,10 @@ class NeRFModel(Model):
             levels=self.config.grid_levels,
         )
 
-        # Use the fine field to provide densities for occlusion skipping during training
+        # Use the field to provide densities for occlusion skipping during training
         self.sampler = VolumetricSampler(
             occupancy_grid=self.occupancy_grid,
-            density_fn=self.field_fine.density_fn,
+            density_fn=self.field.density_fn,
         )
         render_step = self.config.render_step_size
         render_step_str = f"{render_step:.6f}" if render_step is not None else "auto"
@@ -143,10 +137,6 @@ class NeRFModel(Model):
             f"resolution={self.config.grid_resolution})."
         )
         self._nerfacc_sampling_logged = False
-        CONSOLE.log(
-            "VanillaNeRF sampling uses nerfacc occupancy grid with render_step_size="
-            f"{self.config.render_step_size:.6f if self.config.render_step_size is not None else 'auto'}"
-        )
 
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
@@ -175,7 +165,7 @@ class NeRFModel(Model):
         def update_occupancy_grid(step: int):
             self.occupancy_grid.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self.field_fine.density_fn(x)
+                occ_eval_fn=lambda x: self.field.density_fn(x)
                 * (self.config.render_step_size if self.config.render_step_size is not None else 1.0),
             )
 
@@ -191,15 +181,15 @@ class NeRFModel(Model):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        if self.field_coarse is None or self.field_fine is None:
+        if self.field is None:
             raise ValueError("populate_fields() must be called before get_param_groups")
-        param_groups["fields"] = list(self.field_coarse.parameters()) + list(self.field_fine.parameters())
+        param_groups["fields"] = list(self.field.parameters())
         if self.temporal_distortion is not None:
             param_groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
         return param_groups
 
     def get_outputs(self, ray_bundle: RayBundle):
-        if self.field_coarse is None or self.field_fine is None:
+        if self.field is None:
             raise ValueError("populate_fields() must be called before get_outputs")
 
         # Volumetric sampling with nerfacc occupancy grid (packed representation)
@@ -229,130 +219,77 @@ class NeRFModel(Model):
             offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
             ray_samples.frustums.set_offsets(offsets)
 
-        # Evaluate both coarse and fine fields on the same samples
-        field_outputs_coarse = self.field_coarse.forward(ray_samples)
-        field_outputs_fine = self.field_fine.forward(ray_samples)
+        # Evaluate field on samples
+        field_outputs = self.field.forward(ray_samples)
         if self.config.use_gradient_scaling:
-            field_outputs_coarse = scale_gradients_by_distance_squared(field_outputs_coarse, ray_samples)
-            field_outputs_fine = scale_gradients_by_distance_squared(field_outputs_fine, ray_samples)
+            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
         # Compute weights from densities using nerfacc for packed rays
         packed_info = nerfacc.pack_info(ray_indices, num_rays)
-        weights_coarse = nerfacc.render_weight_from_density(
+        weights = nerfacc.render_weight_from_density(
             t_starts=ray_samples.frustums.starts[..., 0],
             t_ends=ray_samples.frustums.ends[..., 0],
-            sigmas=field_outputs_coarse[FieldHeadNames.DENSITY][..., 0],
-            packed_info=packed_info,
-        )[0][..., None]
-        weights_fine = nerfacc.render_weight_from_density(
-            t_starts=ray_samples.frustums.starts[..., 0],
-            t_ends=ray_samples.frustums.ends[..., 0],
-            sigmas=field_outputs_fine[FieldHeadNames.DENSITY][..., 0],
+            sigmas=field_outputs[FieldHeadNames.DENSITY][..., 0],
             packed_info=packed_info,
         )[0][..., None]
 
         # Render RGB/Depth/Accumulation (packed)
-        rgb_coarse = self.renderer_rgb(
-            rgb=field_outputs_coarse[FieldHeadNames.RGB],
-            weights=weights_coarse,
+        rgb = self.renderer_rgb(
+            rgb=field_outputs[FieldHeadNames.RGB],
+            weights=weights,
             ray_indices=ray_indices,
             num_rays=num_rays,
         )
-        rgb_fine = self.renderer_rgb(
-            rgb=field_outputs_fine[FieldHeadNames.RGB],
-            weights=weights_fine,
-            ray_indices=ray_indices,
-            num_rays=num_rays,
-        )
-        accumulation_coarse = self.renderer_accumulation(
-            weights=weights_coarse, ray_indices=ray_indices, num_rays=num_rays
-        )
-        accumulation_fine = self.renderer_accumulation(
-            weights=weights_fine, ray_indices=ray_indices, num_rays=num_rays
-        )
-        depth_coarse = self.renderer_depth(
-            weights=weights_coarse, ray_samples=ray_samples, ray_indices=ray_indices, num_rays=num_rays
-        )
-        depth_fine = self.renderer_depth(
-            weights=weights_fine, ray_samples=ray_samples, ray_indices=ray_indices, num_rays=num_rays
-        )
+        accumulation = self.renderer_accumulation(weights=weights, ray_indices=ray_indices, num_rays=num_rays)
+        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples, ray_indices=ray_indices, num_rays=num_rays)
 
         outputs = {
-            "rgb_coarse": rgb_coarse,
-            "rgb_fine": rgb_fine,
-            "accumulation_coarse": accumulation_coarse,
-            "accumulation_fine": accumulation_fine,
-            "depth_coarse": depth_coarse,
-            "depth_fine": depth_fine,
+            "rgb": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+            "num_samples_per_ray": packed_info[:, 1],
         }
         return outputs
 
+    def get_metrics_dict(self, outputs, batch):
+        metrics_dict: Dict[str, torch.Tensor] = {}
+        # Always expose a positive flag + number of samples to confirm nerfacc sampling.
+        if "num_samples_per_ray" in outputs:
+            metrics_dict["nerfacc_active"] = torch.tensor(1.0, device=self.device)
+            metrics_dict["nerfacc_num_samples_per_batch"] = outputs["num_samples_per_ray"].sum()
+        return metrics_dict
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Scaling metrics by coefficients to create the losses.
-        device = outputs["rgb_coarse"].device
+        device = outputs["rgb"].device
         image = batch["image"].to(device)
-        coarse_pred, coarse_image = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=outputs["rgb_coarse"],
-            pred_accumulation=outputs["accumulation_coarse"],
-            gt_image=image,
+        pred_rgb, image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"], pred_accumulation=outputs["accumulation"], gt_image=image
         )
-        fine_pred, fine_image = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=outputs["rgb_fine"],
-            pred_accumulation=outputs["accumulation_fine"],
-            gt_image=image,
-        )
-
-        rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
-        rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
-
-        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
-        loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
-        return loss_dict
+        rgb_loss = self.rgb_loss(image, pred_rgb)
+        return {"rgb_loss": rgb_loss}
 
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        image = batch["image"].to(outputs["rgb_coarse"].device)
+        image = batch["image"].to(outputs["rgb"].device)
         image = self.renderer_rgb.blend_background(image)
-        rgb_coarse = outputs["rgb_coarse"]
-        rgb_fine = outputs["rgb_fine"]
-        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
-        acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
-        assert self.config.collider_params is not None
-        depth_coarse = colormaps.apply_depth_colormap(
-            outputs["depth_coarse"],
-            accumulation=outputs["accumulation_coarse"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
-        )
-        depth_fine = colormaps.apply_depth_colormap(
-            outputs["depth_fine"],
-            accumulation=outputs["accumulation_fine"],
-            near_plane=self.config.collider_params["near_plane"],
-            far_plane=self.config.collider_params["far_plane"],
-        )
+        rgb = outputs["rgb"]
+        acc = colormaps.apply_colormap(outputs["accumulation"])
+        depth = colormaps.apply_depth_colormap(outputs["depth"], accumulation=outputs["accumulation"])
 
-        combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)
-        combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
-        combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
+        combined_rgb = torch.cat([image, rgb], dim=1)
+        combined_acc = torch.cat([acc], dim=1)
+        combined_depth = torch.cat([depth], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb_coarse = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
-        rgb_fine = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
+        rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
 
-        coarse_psnr = self.psnr(image, rgb_coarse)
-        fine_psnr = self.psnr(image, rgb_fine)
-        fine_ssim = self.ssim(image, rgb_fine)
-        fine_lpips = self.lpips(image, rgb_fine)
-        assert isinstance(fine_ssim, torch.Tensor)
+        psnr = self.psnr(image, rgb)
+        ssim = self.ssim(image, rgb)
+        lpips = self.lpips(image, rgb)
 
-        metrics_dict = {
-            "psnr": float(fine_psnr.item()),
-            "coarse_psnr": float(coarse_psnr),
-            "fine_psnr": float(fine_psnr),
-            "fine_ssim": float(fine_ssim),
-            "fine_lpips": float(fine_lpips),
-        }
+        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim), "lpips": float(lpips)}
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict
