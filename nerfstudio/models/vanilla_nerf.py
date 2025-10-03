@@ -37,6 +37,7 @@ from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRen
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils import writer as global_writer
 
 
 @dataclass
@@ -169,6 +170,22 @@ class NeRFModel(Model):
                 * (self.config.render_step_size if self.config.render_step_size is not None else 1.0),
             )
 
+        def log_nerfacc_metrics(step: int):
+            # Log explicit nerfacc metrics to dashboards (WandB/TensorBoard/Local).
+            try:
+                if hasattr(self, "_nerfacc_last_samples_sum"):
+                    global_writer.put_scalar(name="Nerfacc/Active", scalar=1.0, step=step)
+                    global_writer.put_scalar(
+                        name="Nerfacc/SamplesPerBatch", scalar=float(self._nerfacc_last_samples_sum), step=step
+                    )
+                # Also expose render step size as a constant for convenience
+                if step == 0:
+                    rstep = self.config.render_step_size if self.config.render_step_size is not None else -1.0
+                    global_writer.put_scalar(name="Nerfacc/RenderStepSize", scalar=float(rstep), step=0)
+            except Exception:
+                # Best-effort logging: never break training due to logging
+                pass
+
         from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackLocation
 
         return [
@@ -176,6 +193,11 @@ class NeRFModel(Model):
                 where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
                 update_every_num_iters=1,
                 func=update_occupancy_grid,
+            ),
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=log_nerfacc_metrics,
             ),
         ]
 
@@ -232,6 +254,11 @@ class NeRFModel(Model):
             sigmas=field_outputs[FieldHeadNames.DENSITY][..., 0],
             packed_info=packed_info,
         )[0][..., None]
+        # Store latest nerfacc sample count for logging callbacks
+        try:
+            self._nerfacc_last_samples_sum = float(packed_info[:, 1].sum())
+        except Exception:
+            self._nerfacc_last_samples_sum = None
 
         # Render RGB/Depth/Accumulation (packed)
         rgb = self.renderer_rgb(
