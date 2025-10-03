@@ -142,6 +142,7 @@ class NeRFModel(Model):
             f"(render_step_size={render_step_str}, levels={self.config.grid_levels}, "
             f"resolution={self.config.grid_resolution})."
         )
+        self._nerfacc_sampling_logged = False
         CONSOLE.log(
             "VanillaNeRF sampling uses nerfacc occupancy grid with render_step_size="
             f"{self.config.render_step_size:.6f if self.config.render_step_size is not None else 'auto'}"
@@ -202,6 +203,10 @@ class NeRFModel(Model):
             raise ValueError("populate_fields() must be called before get_outputs")
 
         # Volumetric sampling with nerfacc occupancy grid (packed representation)
+        if not self._nerfacc_sampling_logged:
+            CONSOLE.log("VanillaNeRF forward pass confirmed nerfacc-based sampling path is active.")
+            self._nerfacc_sampling_logged = True
+
         num_rays = len(ray_bundle)
         near_plane = 0.0
         far_plane = 1e10
