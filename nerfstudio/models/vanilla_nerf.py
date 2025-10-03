@@ -19,8 +19,9 @@ Implementation of vanilla nerf.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
+import nerfacc
 import torch
 from torch.nn import Parameter
 
@@ -31,7 +32,7 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
 from nerfstudio.model_components.losses import MSELoss, scale_gradients_by_distance_squared
-from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
+from nerfstudio.model_components.ray_samplers import VolumetricSampler
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
@@ -42,10 +43,12 @@ class VanillaModelConfig(ModelConfig):
     """Vanilla Model Config"""
 
     _target: Type = field(default_factory=lambda: NeRFModel)
+    # The original Vanilla NeRF sampler settings are unused when nerfacc is enabled.
+    # Kept for backward compatibility with configs but not used.
     num_coarse_samples: int = 64
-    """Number of samples in coarse field evaluation"""
+    """(Unused with nerfacc) Number of samples in coarse field evaluation."""
     num_importance_samples: int = 128
-    """Number of samples in fine field evaluation"""
+    """(Unused with nerfacc) Number of samples in fine field evaluation."""
 
     enable_temporal_distortion: bool = False
     """Specifies whether or not to include ray warping based on time."""
@@ -55,6 +58,18 @@ class VanillaModelConfig(ModelConfig):
     """Use gradient scaler where the gradients are lower for points closer to the camera."""
     background_color: Literal["random", "last_sample", "black", "white"] = "white"
     """Whether to randomize the background color."""
+
+    # nerfacc / instant-ngp style sampling parameters
+    grid_resolution: Union[int, List[int]] = 128
+    """Resolution of the occupancy grid used for sampling."""
+    grid_levels: int = 4
+    """Levels of the occupancy grid used for sampling."""
+    alpha_thre: float = 0.01
+    """Opacity threshold for skipping samples during ray marching."""
+    cone_angle: float = 0.0
+    """Cone angle for ray marching (0.0 for uniform; ~1/256 for real scenes)."""
+    render_step_size: Optional[float] = None
+    """Minimum step size for rendering; auto-computed if None."""
 
 
 class NeRFModel(Model):
@@ -102,14 +117,29 @@ class NeRFModel(Model):
             direction_encoding=direction_encoding,
         )
 
-        # samplers
-        self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
-        self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples)
+        # nerfacc occupancy grid + volumetric sampler (instant-ngp style)
+        self.scene_aabb = Parameter(self.scene_box.aabb.flatten(), requires_grad=False)
+        if self.config.render_step_size is None:
+            # auto step size: ~1000 samples in the base level grid
+            self.config.render_step_size = ((self.scene_aabb[3:] - self.scene_aabb[:3]) ** 2).sum().sqrt().item() / 1000
+
+        self.occupancy_grid = nerfacc.OccGridEstimator(
+            roi_aabb=self.scene_aabb,
+            resolution=self.config.grid_resolution,
+            levels=self.config.grid_levels,
+        )
+
+        # Use the fine field to provide densities for occlusion skipping during training
+        self.sampler = VolumetricSampler(
+            occupancy_grid=self.occupancy_grid,
+            density_fn=self.field_fine.density_fn,
+        )
 
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer()
+        # Expected depth supports packed ray samples from nerfacc.
+        self.renderer_depth = DepthRenderer(method="expected")
 
         # losses
         self.rgb_loss = MSELoss()
@@ -128,6 +158,24 @@ class NeRFModel(Model):
             kind = params.pop("kind")
             self.temporal_distortion = kind.to_temporal_distortion(params)
 
+    def get_training_callbacks(self, training_callback_attributes):
+        def update_occupancy_grid(step: int):
+            self.occupancy_grid.update_every_n_steps(
+                step=step,
+                occ_eval_fn=lambda x: self.field_fine.density_fn(x)
+                * (self.config.render_step_size if self.config.render_step_size is not None else 1.0),
+            )
+
+        from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackLocation
+
+        return [
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                update_every_num_iters=1,
+                func=update_occupancy_grid,
+            ),
+        ]
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         if self.field_coarse is None or self.field_fine is None:
@@ -141,47 +189,76 @@ class NeRFModel(Model):
         if self.field_coarse is None or self.field_fine is None:
             raise ValueError("populate_fields() must be called before get_outputs")
 
-        # uniform sampling
-        ray_samples_uniform = self.sampler_uniform(ray_bundle)
-        if self.temporal_distortion is not None:
-            offsets = None
-            if ray_samples_uniform.times is not None:
-                offsets = self.temporal_distortion(
-                    ray_samples_uniform.frustums.get_positions(), ray_samples_uniform.times
-                )
-            ray_samples_uniform.frustums.set_offsets(offsets)
+        # Volumetric sampling with nerfacc occupancy grid (packed representation)
+        num_rays = len(ray_bundle)
+        near_plane = 0.0
+        far_plane = 1e10
+        if self.config.enable_collider and self.config.collider_params is not None:
+            near_plane = float(self.config.collider_params["near_plane"])
+            far_plane = float(self.config.collider_params["far_plane"])
 
-        # coarse field:
-        field_outputs_coarse = self.field_coarse.forward(ray_samples_uniform)
+        with torch.no_grad():
+            ray_samples, ray_indices = self.sampler(
+                ray_bundle=ray_bundle,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                render_step_size=self.config.render_step_size if self.config.render_step_size is not None else 1e-3,
+                alpha_thre=self.config.alpha_thre,
+                cone_angle=self.config.cone_angle,
+            )
+
+        # temporal distortion if enabled
+        if self.temporal_distortion is not None and ray_samples.times is not None:
+            offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
+            ray_samples.frustums.set_offsets(offsets)
+
+        # Evaluate both coarse and fine fields on the same samples
+        field_outputs_coarse = self.field_coarse.forward(ray_samples)
+        field_outputs_fine = self.field_fine.forward(ray_samples)
         if self.config.use_gradient_scaling:
-            field_outputs_coarse = scale_gradients_by_distance_squared(field_outputs_coarse, ray_samples_uniform)
-        weights_coarse = ray_samples_uniform.get_weights(field_outputs_coarse[FieldHeadNames.DENSITY])
+            field_outputs_coarse = scale_gradients_by_distance_squared(field_outputs_coarse, ray_samples)
+            field_outputs_fine = scale_gradients_by_distance_squared(field_outputs_fine, ray_samples)
+
+        # Compute weights from densities using nerfacc for packed rays
+        packed_info = nerfacc.pack_info(ray_indices, num_rays)
+        weights_coarse = nerfacc.render_weight_from_density(
+            t_starts=ray_samples.frustums.starts[..., 0],
+            t_ends=ray_samples.frustums.ends[..., 0],
+            sigmas=field_outputs_coarse[FieldHeadNames.DENSITY][..., 0],
+            packed_info=packed_info,
+        )[0][..., None]
+        weights_fine = nerfacc.render_weight_from_density(
+            t_starts=ray_samples.frustums.starts[..., 0],
+            t_ends=ray_samples.frustums.ends[..., 0],
+            sigmas=field_outputs_fine[FieldHeadNames.DENSITY][..., 0],
+            packed_info=packed_info,
+        )[0][..., None]
+
+        # Render RGB/Depth/Accumulation (packed)
         rgb_coarse = self.renderer_rgb(
             rgb=field_outputs_coarse[FieldHeadNames.RGB],
             weights=weights_coarse,
+            ray_indices=ray_indices,
+            num_rays=num_rays,
         )
-        accumulation_coarse = self.renderer_accumulation(weights_coarse)
-        depth_coarse = self.renderer_depth(weights_coarse, ray_samples_uniform)
-
-        # pdf sampling
-        ray_samples_pdf = self.sampler_pdf(ray_bundle, ray_samples_uniform, weights_coarse)
-        if self.temporal_distortion is not None:
-            offsets = None
-            if ray_samples_pdf.times is not None:
-                offsets = self.temporal_distortion(ray_samples_pdf.frustums.get_positions(), ray_samples_pdf.times)
-            ray_samples_pdf.frustums.set_offsets(offsets)
-
-        # fine field:
-        field_outputs_fine = self.field_fine.forward(ray_samples_pdf)
-        if self.config.use_gradient_scaling:
-            field_outputs_fine = scale_gradients_by_distance_squared(field_outputs_fine, ray_samples_pdf)
-        weights_fine = ray_samples_pdf.get_weights(field_outputs_fine[FieldHeadNames.DENSITY])
         rgb_fine = self.renderer_rgb(
             rgb=field_outputs_fine[FieldHeadNames.RGB],
             weights=weights_fine,
+            ray_indices=ray_indices,
+            num_rays=num_rays,
         )
-        accumulation_fine = self.renderer_accumulation(weights_fine)
-        depth_fine = self.renderer_depth(weights_fine, ray_samples_pdf)
+        accumulation_coarse = self.renderer_accumulation(
+            weights=weights_coarse, ray_indices=ray_indices, num_rays=num_rays
+        )
+        accumulation_fine = self.renderer_accumulation(
+            weights=weights_fine, ray_indices=ray_indices, num_rays=num_rays
+        )
+        depth_coarse = self.renderer_depth(
+            weights=weights_coarse, ray_samples=ray_samples, ray_indices=ray_indices, num_rays=num_rays
+        )
+        depth_fine = self.renderer_depth(
+            weights=weights_fine, ray_samples=ray_samples, ray_indices=ray_indices, num_rays=num_rays
+        )
 
         outputs = {
             "rgb_coarse": rgb_coarse,
