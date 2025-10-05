@@ -294,9 +294,13 @@ class TwoMediaNeRFModel(Model):
         num_rays: int,
     ) -> Tensor:
         eps = 1e-8
-        depth_numerator = nerfacc.accumulate_along_rays(weights[..., 0], values=depths, ray_indices=ray_indices, n_rays=num_rays)
+        depth_values = depths[..., None]
+        depth_numerator = nerfacc.accumulate_along_rays(
+            weights[..., 0], values=depth_values, ray_indices=ray_indices, n_rays=num_rays
+        )
         acc = nerfacc.accumulate_along_rays(weights[..., 0], values=None, ray_indices=ray_indices, n_rays=num_rays)
-        depth = depth_numerator / (acc + eps)
+        depth = depth_numerator / (acc.unsqueeze(-1) + eps)
+        depth = depth.squeeze(-1)
         depth = torch.nan_to_num(depth)
         return depth
 
