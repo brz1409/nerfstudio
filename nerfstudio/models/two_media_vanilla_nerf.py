@@ -543,7 +543,7 @@ class TwoMediaNeRFModel(Model):
         image = self.renderer_rgb.blend_background(image)
         rgb = outputs["rgb"]
         acc = colormaps.apply_colormap(outputs["accumulation"])
-        depth = colormaps.apply_depth_colormap(outputs["depth"].unsqueeze(-1), accumulation=outputs["accumulation"])
+        depth = colormaps.apply_depth_colormap(outputs["depth"], accumulation=outputs["accumulation"])
 
         combined_rgb = torch.cat([image, rgb], dim=1)
         combined_acc = torch.cat([acc], dim=1)
