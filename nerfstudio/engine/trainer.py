@@ -26,7 +26,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
+from typing import Any, DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
 
 import torch
 import viser
@@ -505,23 +505,50 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         output_path = self.checkpoint_dir / "camera_distribution.png"
 
-        fig, (ax_xy, ax_hist) = plt.subplots(1, 2, figsize=(10, 4))
+        fig = plt.figure(figsize=(12, 8))
+        gs = fig.add_gridspec(2, 3)
+        ax_top = fig.add_subplot(gs[0, :])
+        ax_left = fig.add_subplot(gs[1, 0])
+        ax_right = fig.add_subplot(gs[1, 1])
+        ax_back = fig.add_subplot(gs[1, 2])
+
+        def _dedup_legend(axis):
+            handles, labels = axis.get_legend_handles_labels()
+            if not handles:
+                return
+            unique: Dict[str, Any] = {}
+            for handle, label in zip(handles, labels):
+                if label not in unique:
+                    unique[label] = handle
+            axis.legend(unique.values(), unique.keys(), loc="best")
 
         for name, pos in splits:
             pos_np = pos.detach().cpu().numpy()
-            ax_xy.scatter(pos_np[:, 0], pos_np[:, 1], s=10, label=name)
-            ax_hist.hist(pos_np[:, 2], bins=30, alpha=0.6, label=name, density=False)
+            ax_top.scatter(pos_np[:, 0], pos_np[:, 1], s=12, label=name)
+            ax_left.scatter(pos_np[:, 1], pos_np[:, 2], s=12, label=name)
+            ax_right.scatter(-pos_np[:, 1], pos_np[:, 2], s=12, label=name)
+            ax_back.scatter(-pos_np[:, 0], pos_np[:, 2], s=12, label=name)
 
-        ax_xy.set_xlabel("x")
-        ax_xy.set_ylabel("y")
-        ax_xy.set_title("Top-down camera positions")
-        ax_xy.legend(loc="best")
-        ax_xy.set_aspect("equal", adjustable="box")
+        ax_top.set_xlabel("x")
+        ax_top.set_ylabel("y")
+        ax_top.set_title("Top-down view (x vs y)")
+        ax_top.set_aspect("equal", adjustable="box")
+        _dedup_legend(ax_top)
 
-        ax_hist.set_xlabel("z")
-        ax_hist.set_ylabel("count")
-        ax_hist.set_title("Camera height distribution")
-        ax_hist.legend(loc="best")
+        ax_left.set_xlabel("y")
+        ax_left.set_ylabel("z")
+        ax_left.set_title("Left view (y vs z)")
+        _dedup_legend(ax_left)
+
+        ax_right.set_xlabel("-y")
+        ax_right.set_ylabel("z")
+        ax_right.set_title("Right view (-y vs z)")
+        _dedup_legend(ax_right)
+
+        ax_back.set_xlabel("-x")
+        ax_back.set_ylabel("z")
+        ax_back.set_title("Back view (-x vs z)")
+        _dedup_legend(ax_back)
 
         water_height: Optional[float] = None
         model = getattr(self.pipeline, "model", None)
@@ -537,10 +564,19 @@ class Trainer:
                 water_height = None
 
         if water_height is not None:
-            ax_hist.axvline(water_height, color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
-            ax_hist.legend(loc="best")
+            for axis in (ax_left, ax_right, ax_back):
+                axis.axhline(water_height, color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
+                _dedup_legend(axis)
+            ax_top.text(
+                0.02,
+                0.95,
+                f"water z = {water_height:.3f}",
+                transform=ax_top.transAxes,
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="tab:orange", alpha=0.7),
+            )
 
-        fig.suptitle("Camera distribution in NeRF space")
+        fig.suptitle("Camera distribution views in NeRF space")
         fig.tight_layout()
         fig.savefig(output_path, dpi=200)
         plt.close(fig)
