@@ -398,10 +398,22 @@ class TwoMediaNeRFModel(Model):
         hit_indices = torch.nonzero(valid_hit, as_tuple=False).squeeze(-1)
         has_water = hit_indices.numel() > 0
 
-        weights_water = torch.zeros((0, 1), device=device, dtype=dtype)
-        ray_indices_water = torch.zeros((0,), dtype=torch.long, device=device)
-        rgb_water = torch.zeros((0, 3), device=device, dtype=dtype)
-        depth_mid_water = torch.zeros((0,), device=device, dtype=dtype)
+        transmittance_air = torch.ones((num_rays,), device=device, dtype=dtype)
+        if weights_air.numel() > 0:
+            accum_air = nerfacc.accumulate_along_rays(
+                weights_air[..., 0], values=None, ray_indices=ray_indices_air, n_rays=num_rays
+            )
+            transmittance_air = torch.clamp(1.0 - accum_air, min=0.0, max=1.0)
+
+        def gather_metadata(indices: Tensor) -> Dict[str, Tensor]:
+            if not flat_bundle.metadata:
+                return {}
+            return {k: v[indices] for k, v in flat_bundle.metadata.items()}
+
+        water_weights_chunks: List[Tensor] = []
+        water_indices_chunks: List[Tensor] = []
+        water_rgb_chunks: List[Tensor] = []
+        water_depth_chunks: List[Tensor] = []
 
         if has_water:
             entry_depths = t_intersection[hit_indices]
@@ -417,7 +429,7 @@ class TwoMediaNeRFModel(Model):
                 refracted_dirs = self._compute_refraction(directions[keep_indices])
                 water_origins = entry_points + refracted_dirs * surface_eps
 
-                metadata_subset = {k: v[keep_indices] for k, v in flat_bundle.metadata.items()}
+                metadata_subset = gather_metadata(keep_indices)
                 water_bundle = RayBundle(
                     origins=water_origins,
                     directions=refracted_dirs,
@@ -429,8 +441,6 @@ class TwoMediaNeRFModel(Model):
                     times=None if flat_bundle.times is None else flat_bundle.times[keep_indices],
                 )
 
-                # WICHTIG: Auch hier kein torch.no_grad()! Das Water-Sampling benötigt ebenfalls
-                # Gradienten für das Occupancy Grid Update.
                 ray_samples_water, ray_indices_subset = self.sampler(
                     ray_bundle=water_bundle,
                     near_plane=0.0,
@@ -460,21 +470,73 @@ class TwoMediaNeRFModel(Model):
                     packed_info=packed_info_water,
                 )[0][..., None]
 
-                transmittance_air = torch.ones((num_rays,), device=device, dtype=dtype)
-                if weights_air.numel() > 0:
-                    accum_air = nerfacc.accumulate_along_rays(
-                        weights_air[..., 0], values=None, ray_indices=ray_indices_air, n_rays=num_rays
-                    )
-                    transmittance_air = torch.clamp(1.0 - accum_air, min=0.0, max=1.0)
-
                 weights_water = weights_water_raw * transmittance_air[global_ray_indices][:, None]
-                ray_indices_water = global_ray_indices
-                rgb_water = field_water[FieldHeadNames.RGB]
+                water_weights_chunks.append(weights_water)
+                water_indices_chunks.append(global_ray_indices)
+                water_rgb_chunks.append(field_water[FieldHeadNames.RGB])
 
                 depth_mid_water = (
                     ((ray_samples_water.frustums.starts + ray_samples_water.frustums.ends) / 2.0)[..., 0]
                     + entry_depths[ray_indices_subset]
                 )
+                water_depth_chunks.append(depth_mid_water)
+
+        underwater_indices = torch.nonzero(starts_underwater, as_tuple=False).squeeze(-1)
+        if underwater_indices.numel() > 0:
+            water_nears = base_near[underwater_indices]
+            water_fars = base_far[underwater_indices]
+            valid_under = water_fars > water_nears + surface_eps
+            if valid_under.any():
+                under_keep = underwater_indices[valid_under]
+                near_vals = water_nears[valid_under]
+                far_vals = torch.clamp(water_fars[valid_under] - surface_eps, min=near_vals + surface_eps)
+
+                metadata_under = gather_metadata(under_keep)
+                water_bundle_under = RayBundle(
+                    origins=origins[under_keep],
+                    directions=directions[under_keep],
+                    pixel_area=flat_bundle.pixel_area[under_keep],
+                    camera_indices=None if flat_bundle.camera_indices is None else flat_bundle.camera_indices[under_keep],
+                    nears=near_vals.unsqueeze(-1),
+                    fars=far_vals.unsqueeze(-1),
+                    metadata=metadata_under,
+                    times=None if flat_bundle.times is None else flat_bundle.times[under_keep],
+                )
+
+                ray_samples_under, ray_indices_under_local = self.sampler(
+                    ray_bundle=water_bundle_under,
+                    near_plane=near_plane,
+                    far_plane=far_plane,
+                    render_step_size=render_step,
+                    alpha_thre=self.config.alpha_thre,
+                    cone_angle=self.config.cone_angle,
+                )
+
+                if self.temporal_distortion is not None and ray_samples_under.times is not None:
+                    offsets_under = self.temporal_distortion(
+                        ray_samples_under.frustums.get_positions(), ray_samples_under.times
+                    )
+                    ray_samples_under.frustums.set_offsets(offsets_under)
+
+                field_water_under = self.water_field.forward(ray_samples_under)
+                if self.config.use_gradient_scaling:
+                    field_water_under = scale_gradients_by_distance_squared(field_water_under, ray_samples_under)
+
+                global_under_indices = under_keep[ray_indices_under_local]
+                packed_info_under = nerfacc.pack_info(global_under_indices, num_rays)
+                weights_water_under_raw = nerfacc.render_weight_from_density(
+                    t_starts=ray_samples_under.frustums.starts[..., 0],
+                    t_ends=ray_samples_under.frustums.ends[..., 0],
+                    sigmas=field_water_under[FieldHeadNames.DENSITY][..., 0],
+                    packed_info=packed_info_under,
+                )[0][..., None]
+
+                weights_water_under = weights_water_under_raw * transmittance_air[global_under_indices][:, None]
+                water_weights_chunks.append(weights_water_under)
+                water_indices_chunks.append(global_under_indices)
+                water_rgb_chunks.append(field_water_under[FieldHeadNames.RGB])
+                depth_mid_under = ((ray_samples_under.frustums.starts + ray_samples_under.frustums.ends) / 2.0)[..., 0]
+                water_depth_chunks.append(depth_mid_under)
 
         rgb_air = field_air[FieldHeadNames.RGB]
         depth_mid_air = ((ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0)[..., 0]
@@ -484,7 +546,12 @@ class TwoMediaNeRFModel(Model):
         ray_indices_all = ray_indices_air
         depth_all = depth_mid_air
 
-        if weights_water.numel() > 0:
+        if water_weights_chunks:
+            weights_water = torch.cat(water_weights_chunks, dim=0)
+            rgb_water = torch.cat(water_rgb_chunks, dim=0)
+            ray_indices_water = torch.cat(water_indices_chunks, dim=0)
+            depth_mid_water = torch.cat(water_depth_chunks, dim=0)
+
             weights_all = torch.cat([weights_all, weights_water], dim=0)
             rgb_all = torch.cat([rgb_all, rgb_water], dim=0)
             ray_indices_all = torch.cat([ray_indices_all, ray_indices_water], dim=0)
