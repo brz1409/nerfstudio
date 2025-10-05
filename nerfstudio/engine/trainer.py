@@ -510,12 +510,9 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         output_path = self.checkpoint_dir / "camera_distribution.png"
 
-        fig = plt.figure(figsize=(12, 8))
-        gs = fig.add_gridspec(2, 3)
-        ax_top = fig.add_subplot(gs[0, :])
-        ax_left = fig.add_subplot(gs[1, 0])
-        ax_right = fig.add_subplot(gs[1, 1])
-        ax_back = fig.add_subplot(gs[1, 2])
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+        ax_top, ax_left = axes[0, 0], axes[0, 1]
+        ax_right, ax_back = axes[1, 0], axes[1, 1]
 
         def _dedup_legend(axis):
             handles, labels = axis.get_legend_handles_labels()
@@ -528,11 +525,24 @@ class Trainer:
             axis.legend(unique.values(), unique.keys(), loc="best")
 
         all_positions = torch.cat([pos for _, pos, _ in splits], dim=0)
-        extent = all_positions.max(dim=0).values - all_positions.min(dim=0).values
+        min_bounds = all_positions.min(dim=0).values
+        max_bounds = all_positions.max(dim=0).values
+        extent = max_bounds - min_bounds
         max_extent = float(extent.max().item()) if extent.numel() > 0 else 1.0
         arrow_length = max(max_extent * 0.08, 1e-3)
 
         color_cycle = plt.get_cmap("tab10")
+
+        view_specs = [
+            ("Top-down (x/y)", ax_top, (0, 1), (1.0, 1.0), ("x", "y")),
+            ("Left (y/z)", ax_left, (1, 2), (1.0, 1.0), ("y", "z")),
+            ("Right (y/z)", ax_right, (1, 2), (-1.0, 1.0), ("y", "z")),
+            ("Back (x/z)", ax_back, (0, 2), (-1.0, 1.0), ("x", "z")),
+        ]
+
+        def _project(values: np.ndarray, indices: Tuple[int, int], signs: Tuple[float, float]) -> np.ndarray:
+            projected = np.stack([values[:, indices[0]] * signs[0], values[:, indices[1]] * signs[1]], axis=1)
+            return projected
 
         for idx, (name, pos, dirs) in enumerate(splits):
             color = color_cycle(idx % 10)
@@ -541,76 +551,29 @@ class Trainer:
             norms = np.linalg.norm(dir_np, axis=1, keepdims=True)
             dir_np = np.divide(dir_np, np.maximum(norms, 1e-8)) * arrow_length
 
-            ax_top.scatter(pos_np[:, 0], pos_np[:, 1], s=12, label=name, color=color)
-            ax_left.scatter(pos_np[:, 1], pos_np[:, 2], s=12, label=name, color=color)
-            ax_right.scatter(-pos_np[:, 1], pos_np[:, 2], s=12, label=name, color=color)
-            ax_back.scatter(-pos_np[:, 0], pos_np[:, 2], s=12, label=name, color=color)
+            for title, axis, indices, signs, labels in view_specs:
+                proj_pos = _project(pos_np, indices, signs)
+                proj_dir = _project(dir_np, indices, signs)
+                axis.scatter(proj_pos[:, 0], proj_pos[:, 1], s=12, label=name, color=color, alpha=0.85)
+                axis.quiver(
+                    proj_pos[:, 0],
+                    proj_pos[:, 1],
+                    proj_dir[:, 0],
+                    proj_dir[:, 1],
+                    angles="xy",
+                    scale_units="xy",
+                    scale=1.0,
+                    color=color,
+                    width=0.003,
+                    alpha=0.75,
+                )
 
-            ax_top.quiver(
-                pos_np[:, 0],
-                pos_np[:, 1],
-                dir_np[:, 0],
-                dir_np[:, 1],
-                angles="xy",
-                scale_units="xy",
-                scale=1.0,
-                color=color,
-                width=0.003,
-                alpha=0.8,
-            )
-            ax_left.quiver(
-                pos_np[:, 1],
-                pos_np[:, 2],
-                dir_np[:, 1],
-                dir_np[:, 2],
-                angles="xy",
-                scale_units="xy",
-                scale=1.0,
-                color=color,
-                width=0.003,
-                alpha=0.8,
-            )
-            ax_right.quiver(
-                -pos_np[:, 1],
-                pos_np[:, 2],
-                -dir_np[:, 1],
-                dir_np[:, 2],
-                angles="xy",
-                scale_units="xy",
-                scale=1.0,
-                color=color,
-                width=0.003,
-                alpha=0.8,
-            )
-            ax_back.quiver(
-                -pos_np[:, 0],
-                pos_np[:, 2],
-                -dir_np[:, 0],
-                dir_np[:, 2],
-                angles="xy",
-                scale_units="xy",
-                scale=1.0,
-                color=color,
-                width=0.003,
-                alpha=0.8,
-            )
-
-        ax_top.set_xlabel("x")
-        ax_top.set_ylabel("y")
-        ax_top.set_title("Top-down view (x vs y)")
-        ax_top.set_aspect("equal", adjustable="box")
-
-        ax_left.set_xlabel("y")
-        ax_left.set_ylabel("z")
-        ax_left.set_title("Left view (y vs z)")
-
-        ax_right.set_xlabel("-y")
-        ax_right.set_ylabel("z")
-        ax_right.set_title("Right view (-y vs z)")
-
-        ax_back.set_xlabel("-x")
-        ax_back.set_ylabel("z")
-        ax_back.set_title("Back view (-x vs z)")
+        for title, axis, _, _, labels in view_specs:
+            axis.set_title(title)
+            axis.set_xlabel(labels[0])
+            axis.set_ylabel(labels[1])
+            axis.set_aspect("equal", adjustable="box")
+            _dedup_legend(axis)
 
         water_height: Optional[float] = None
         model = getattr(self.pipeline, "model", None)
@@ -626,22 +589,21 @@ class Trainer:
                 water_height = None
 
         if water_height is not None:
-            for axis in (ax_left, ax_right, ax_back):
-                axis.axhline(water_height, color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
+            for title, axis, indices, signs, _ in view_specs:
+                if indices[1] == 2:
+                    axis.axhline(water_height * signs[1], color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
             ax_top.text(
                 0.02,
-                0.95,
-                f"water z = {water_height:.3f}",
+                0.94,
+                f"water z ≈ {water_height:.3f}",
                 transform=ax_top.transAxes,
-                fontsize=10,
+                fontsize=11,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="tab:orange", alpha=0.7),
             )
+            for _, axis, _, _, _ in view_specs:
+                _dedup_legend(axis)
 
-        for axis in (ax_top, ax_left, ax_right, ax_back):
-            _dedup_legend(axis)
-
-        fig.suptitle("Camera distribution views in NeRF space")
-        fig.tight_layout()
+        fig.suptitle("Camera distribution and viewing directions in NeRF space", fontsize=14)
         fig.savefig(output_path, dpi=200)
         plt.close(fig)
 
