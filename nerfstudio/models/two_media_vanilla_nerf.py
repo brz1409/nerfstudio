@@ -300,7 +300,6 @@ class TwoMediaNeRFModel(Model):
         )
         acc = nerfacc.accumulate_along_rays(weights[..., 0], values=None, ray_indices=ray_indices, n_rays=num_rays)
         depth = depth_numerator / (acc.unsqueeze(-1) + eps)
-        depth = depth.squeeze(-1)
         depth = torch.nan_to_num(depth)
         return depth
 
