@@ -388,12 +388,23 @@ class TwoMediaNeRFModel(Model):
             field_air = scale_gradients_by_distance_squared(field_air, ray_samples_air)
 
         packed_info_air = nerfacc.pack_info(ray_indices_air, num_rays)
-        weights_air = nerfacc.render_weight_from_density(
-            t_starts=ray_samples_air.frustums.starts[..., 0],
-            t_ends=ray_samples_air.frustums.ends[..., 0],
-            sigmas=field_air[FieldHeadNames.DENSITY][..., 0],
-            packed_info=packed_info_air,
-        )[0][..., None]
+
+        def ensure_column(weights: Tensor) -> Tensor:
+            """Shape nerfacc weights as (samples, 1) regardless of upstream dimensionality."""
+            if weights.ndim == 1:
+                return weights.unsqueeze(-1)
+            if weights.ndim == 2:
+                return weights
+            return weights.reshape(-1, 1)
+
+        weights_air = ensure_column(
+            nerfacc.render_weight_from_density(
+                t_starts=ray_samples_air.frustums.starts[..., 0],
+                t_ends=ray_samples_air.frustums.ends[..., 0],
+                sigmas=field_air[FieldHeadNames.DENSITY][..., 0],
+                packed_info=packed_info_air,
+            )[0]
+        )
 
         hit_indices = torch.nonzero(valid_hit, as_tuple=False).squeeze(-1)
         has_water = hit_indices.numel() > 0
@@ -463,12 +474,14 @@ class TwoMediaNeRFModel(Model):
                 global_ray_indices = keep_indices[ray_indices_subset]
                 packed_info_water = nerfacc.pack_info(global_ray_indices, num_rays)
 
-                weights_water_raw = nerfacc.render_weight_from_density(
-                    t_starts=ray_samples_water.frustums.starts[..., 0],
-                    t_ends=ray_samples_water.frustums.ends[..., 0],
-                    sigmas=field_water[FieldHeadNames.DENSITY][..., 0],
-                    packed_info=packed_info_water,
-                )[0][..., None]
+                weights_water_raw = ensure_column(
+                    nerfacc.render_weight_from_density(
+                        t_starts=ray_samples_water.frustums.starts[..., 0],
+                        t_ends=ray_samples_water.frustums.ends[..., 0],
+                        sigmas=field_water[FieldHeadNames.DENSITY][..., 0],
+                        packed_info=packed_info_water,
+                    )[0]
+                )
 
                 weights_water = weights_water_raw * transmittance_air[global_ray_indices][:, None]
                 water_weights_chunks.append(weights_water)
@@ -524,12 +537,14 @@ class TwoMediaNeRFModel(Model):
 
                 global_under_indices = under_keep[ray_indices_under_local]
                 packed_info_under = nerfacc.pack_info(global_under_indices, num_rays)
-                weights_water_under_raw = nerfacc.render_weight_from_density(
-                    t_starts=ray_samples_under.frustums.starts[..., 0],
-                    t_ends=ray_samples_under.frustums.ends[..., 0],
-                    sigmas=field_water_under[FieldHeadNames.DENSITY][..., 0],
-                    packed_info=packed_info_under,
-                )[0][..., None]
+                weights_water_under_raw = ensure_column(
+                    nerfacc.render_weight_from_density(
+                        t_starts=ray_samples_under.frustums.starts[..., 0],
+                        t_ends=ray_samples_under.frustums.ends[..., 0],
+                        sigmas=field_water_under[FieldHeadNames.DENSITY][..., 0],
+                        packed_info=packed_info_under,
+                    )[0]
+                )
 
                 weights_water_under = weights_water_under_raw * transmittance_air[global_under_indices][:, None]
                 water_weights_chunks.append(weights_water_under)
