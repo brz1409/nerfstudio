@@ -368,15 +368,16 @@ class TwoMediaNeRFModel(Model):
         )
 
         render_step = self.config.render_step_size if self.config.render_step_size is not None else 1e-3
-        with torch.no_grad():
-            ray_samples_air, ray_indices_air = self.sampler(
-                ray_bundle=air_bundle,
-                near_plane=near_plane,
-                far_plane=far_plane,
-                render_step_size=render_step,
-                alpha_thre=self.config.alpha_thre,
-                cone_angle=self.config.cone_angle,
-            )
+        # WICHTIG: Kein torch.no_grad() hier! Das verhindert, dass nerfacc Samples generiert.
+        # Die density_fn benötigt Gradienten für das Occupancy Grid Update.
+        ray_samples_air, ray_indices_air = self.sampler(
+            ray_bundle=air_bundle,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            render_step_size=render_step,
+            alpha_thre=self.config.alpha_thre,
+            cone_angle=self.config.cone_angle,
+        )
 
         if self.temporal_distortion is not None and ray_samples_air.times is not None:
             offsets_air = self.temporal_distortion(ray_samples_air.frustums.get_positions(), ray_samples_air.times)
@@ -428,15 +429,16 @@ class TwoMediaNeRFModel(Model):
                     times=None if flat_bundle.times is None else flat_bundle.times[keep_indices],
                 )
 
-                with torch.no_grad():
-                    ray_samples_water, ray_indices_subset = self.sampler(
-                        ray_bundle=water_bundle,
-                        near_plane=0.0,
-                        far_plane=far_plane,
-                        render_step_size=render_step,
-                        alpha_thre=self.config.alpha_thre,
-                        cone_angle=self.config.cone_angle,
-                    )
+                # WICHTIG: Auch hier kein torch.no_grad()! Das Water-Sampling benötigt ebenfalls
+                # Gradienten für das Occupancy Grid Update.
+                ray_samples_water, ray_indices_subset = self.sampler(
+                    ray_bundle=water_bundle,
+                    near_plane=0.0,
+                    far_plane=far_plane,
+                    render_step_size=render_step,
+                    alpha_thre=self.config.alpha_thre,
+                    cone_angle=self.config.cone_angle,
+                )
 
                 if self.temporal_distortion is not None and ray_samples_water.times is not None:
                     offsets_water = self.temporal_distortion(
