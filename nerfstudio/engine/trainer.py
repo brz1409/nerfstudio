@@ -28,6 +28,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, DefaultDict, Dict, List, Literal, Optional, Tuple, Type, cast
 
+import numpy as np
 import torch
 import viser
 from rich import box, style
@@ -473,7 +474,7 @@ class Trainer:
         if datamanager is None:
             return
 
-        def _positions_from_outputs(outputs) -> Optional[torch.Tensor]:
+        def _pose_info_from_outputs(outputs) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
             cameras = getattr(outputs, "cameras", None)
             if cameras is None:
                 return None
@@ -484,19 +485,23 @@ class Trainer:
             if tensor.numel() == 0:
                 return None
             origins = tensor[..., :3, 3]
-            return origins.reshape(-1, 3)
+            rotations = tensor[..., :3, :3]
+            forwards = -rotations[..., :, 2]
+            origins = origins.reshape(-1, 3)
+            forwards = forwards.reshape(-1, 3)
+            return origins, forwards
 
-        splits: List[Tuple[str, torch.Tensor]] = []
+        splits: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
 
         train_outputs = getattr(datamanager, "train_dataparser_outputs", None)
-        train_positions = _positions_from_outputs(train_outputs) if train_outputs is not None else None
-        if train_positions is not None:
-            splits.append(("train", train_positions))
+        train_info = _pose_info_from_outputs(train_outputs) if train_outputs is not None else None
+        if train_info is not None:
+            splits.append(("train", *train_info))
 
         eval_outputs = getattr(datamanager, "eval_dataparser_outputs", None)
-        eval_positions = _positions_from_outputs(eval_outputs) if eval_outputs is not None else None
-        if eval_positions is not None:
-            splits.append(("eval", eval_positions))
+        eval_info = _pose_info_from_outputs(eval_outputs) if eval_outputs is not None else None
+        if eval_info is not None:
+            splits.append(("eval", *eval_info))
 
         if not splits:
             return
@@ -522,33 +527,90 @@ class Trainer:
                     unique[label] = handle
             axis.legend(unique.values(), unique.keys(), loc="best")
 
-        for name, pos in splits:
+        all_positions = torch.cat([pos for _, pos, _ in splits], dim=0)
+        extent = all_positions.max(dim=0).values - all_positions.min(dim=0).values
+        max_extent = float(extent.max().item()) if extent.numel() > 0 else 1.0
+        arrow_length = max(max_extent * 0.08, 1e-3)
+
+        color_cycle = plt.get_cmap("tab10")
+
+        for idx, (name, pos, dirs) in enumerate(splits):
+            color = color_cycle(idx % 10)
             pos_np = pos.detach().cpu().numpy()
-            ax_top.scatter(pos_np[:, 0], pos_np[:, 1], s=12, label=name)
-            ax_left.scatter(pos_np[:, 1], pos_np[:, 2], s=12, label=name)
-            ax_right.scatter(-pos_np[:, 1], pos_np[:, 2], s=12, label=name)
-            ax_back.scatter(-pos_np[:, 0], pos_np[:, 2], s=12, label=name)
+            dir_np = dirs.detach().cpu().numpy()
+            norms = np.linalg.norm(dir_np, axis=1, keepdims=True)
+            dir_np = np.divide(dir_np, np.maximum(norms, 1e-8)) * arrow_length
+
+            ax_top.scatter(pos_np[:, 0], pos_np[:, 1], s=12, label=name, color=color)
+            ax_left.scatter(pos_np[:, 1], pos_np[:, 2], s=12, label=name, color=color)
+            ax_right.scatter(-pos_np[:, 1], pos_np[:, 2], s=12, label=name, color=color)
+            ax_back.scatter(-pos_np[:, 0], pos_np[:, 2], s=12, label=name, color=color)
+
+            ax_top.quiver(
+                pos_np[:, 0],
+                pos_np[:, 1],
+                dir_np[:, 0],
+                dir_np[:, 1],
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                color=color,
+                width=0.003,
+                alpha=0.8,
+            )
+            ax_left.quiver(
+                pos_np[:, 1],
+                pos_np[:, 2],
+                dir_np[:, 1],
+                dir_np[:, 2],
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                color=color,
+                width=0.003,
+                alpha=0.8,
+            )
+            ax_right.quiver(
+                -pos_np[:, 1],
+                pos_np[:, 2],
+                -dir_np[:, 1],
+                dir_np[:, 2],
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                color=color,
+                width=0.003,
+                alpha=0.8,
+            )
+            ax_back.quiver(
+                -pos_np[:, 0],
+                pos_np[:, 2],
+                -dir_np[:, 0],
+                dir_np[:, 2],
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                color=color,
+                width=0.003,
+                alpha=0.8,
+            )
 
         ax_top.set_xlabel("x")
         ax_top.set_ylabel("y")
         ax_top.set_title("Top-down view (x vs y)")
         ax_top.set_aspect("equal", adjustable="box")
-        _dedup_legend(ax_top)
 
         ax_left.set_xlabel("y")
         ax_left.set_ylabel("z")
         ax_left.set_title("Left view (y vs z)")
-        _dedup_legend(ax_left)
 
         ax_right.set_xlabel("-y")
         ax_right.set_ylabel("z")
         ax_right.set_title("Right view (-y vs z)")
-        _dedup_legend(ax_right)
 
         ax_back.set_xlabel("-x")
         ax_back.set_ylabel("z")
         ax_back.set_title("Back view (-x vs z)")
-        _dedup_legend(ax_back)
 
         water_height: Optional[float] = None
         model = getattr(self.pipeline, "model", None)
@@ -566,7 +628,6 @@ class Trainer:
         if water_height is not None:
             for axis in (ax_left, ax_right, ax_back):
                 axis.axhline(water_height, color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
-                _dedup_legend(axis)
             ax_top.text(
                 0.02,
                 0.95,
@@ -575,6 +636,9 @@ class Trainer:
                 fontsize=10,
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="tab:orange", alpha=0.7),
             )
+
+        for axis in (ax_top, ax_left, ax_right, ax_back):
+            _dedup_legend(axis)
 
         fig.suptitle("Camera distribution views in NeRF space")
         fig.tight_layout()
