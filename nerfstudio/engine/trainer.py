@@ -36,6 +36,10 @@ from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
 
 from nerfstudio.configs.experiment_config import ExperimentConfig
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover - plotting is optional
+    plt = None
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
@@ -197,6 +201,9 @@ class Trainer:
         self._check_viewer_warnings()
 
         self._load_checkpoint()
+
+        if self.local_rank == 0:
+            self._export_camera_distributions()
 
         self.callbacks = self.pipeline.get_training_callbacks(
             TrainingCallbackAttributes(
@@ -451,6 +458,94 @@ class Trainer:
             CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_checkpoint}")
         else:
             CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
+
+    def _export_camera_distributions(self) -> None:
+        """Save simple camera distribution visualisations next to checkpoints."""
+
+        if plt is None:
+            CONSOLE.log(
+                "Matplotlib unavailable; skipping camera distribution plot.",
+                style="yellow",
+            )
+            return
+
+        datamanager = getattr(self.pipeline, "datamanager", None)
+        if datamanager is None:
+            return
+
+        def _positions_from_outputs(outputs) -> Optional[torch.Tensor]:
+            cameras = getattr(outputs, "cameras", None)
+            if cameras is None:
+                return None
+            camera_to_worlds = getattr(cameras, "camera_to_worlds", None)
+            if camera_to_worlds is None:
+                return None
+            tensor = torch.as_tensor(camera_to_worlds)
+            if tensor.numel() == 0:
+                return None
+            origins = tensor[..., :3, 3]
+            return origins.reshape(-1, 3)
+
+        splits: List[Tuple[str, torch.Tensor]] = []
+
+        train_outputs = getattr(datamanager, "train_dataparser_outputs", None)
+        train_positions = _positions_from_outputs(train_outputs) if train_outputs is not None else None
+        if train_positions is not None:
+            splits.append(("train", train_positions))
+
+        eval_outputs = getattr(datamanager, "eval_dataparser_outputs", None)
+        eval_positions = _positions_from_outputs(eval_outputs) if eval_outputs is not None else None
+        if eval_positions is not None:
+            splits.append(("eval", eval_positions))
+
+        if not splits:
+            return
+
+        # ensure directory exists before we attempt to save
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        output_path = self.checkpoint_dir / "camera_distribution.png"
+
+        fig, (ax_xy, ax_hist) = plt.subplots(1, 2, figsize=(10, 4))
+
+        for name, pos in splits:
+            pos_np = pos.detach().cpu().numpy()
+            ax_xy.scatter(pos_np[:, 0], pos_np[:, 1], s=10, label=name)
+            ax_hist.hist(pos_np[:, 2], bins=30, alpha=0.6, label=name, density=False)
+
+        ax_xy.set_xlabel("x")
+        ax_xy.set_ylabel("y")
+        ax_xy.set_title("Top-down camera positions")
+        ax_xy.legend(loc="best")
+        ax_xy.set_aspect("equal", adjustable="box")
+
+        ax_hist.set_xlabel("z")
+        ax_hist.set_ylabel("count")
+        ax_hist.set_title("Camera height distribution")
+        ax_hist.legend(loc="best")
+
+        water_height: Optional[float] = None
+        model = getattr(self.pipeline, "model", None)
+        normal = getattr(model, "water_plane_normal", None)
+        offset = getattr(model, "water_plane_offset", None)
+        if normal is not None and offset is not None:
+            try:
+                normal_t = torch.as_tensor(normal).detach().cpu().view(-1)
+                offset_t = torch.as_tensor(offset).detach().cpu().view(-1)
+                if normal_t.numel() >= 3 and offset_t.numel() >= 1 and float(normal_t[2]) != 0.0:
+                    water_height = float(-offset_t[0] / normal_t[2])
+            except Exception:
+                water_height = None
+
+        if water_height is not None:
+            ax_hist.axvline(water_height, color="tab:orange", linestyle="--", linewidth=1.5, label="water plane")
+            ax_hist.legend(loc="best")
+
+        fig.suptitle("Camera distribution in NeRF space")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+
+        CONSOLE.log(f"Saved camera distribution plot to: {output_path}")
 
     @check_main_thread
     def save_checkpoint(self, step: int) -> None:
