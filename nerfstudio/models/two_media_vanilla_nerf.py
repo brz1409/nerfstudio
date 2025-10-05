@@ -556,18 +556,18 @@ class TwoMediaNeRFModel(Model):
         rgb_air = field_air[FieldHeadNames.RGB]
         depth_mid_air = ((ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0)[..., 0]
 
-        weights_all = weights_air
+        weights_all = ensure_column(weights_air)
         rgb_all = rgb_air
         ray_indices_all = ray_indices_air
         depth_all = depth_mid_air
 
         if water_weights_chunks:
-            weights_water = torch.cat(water_weights_chunks, dim=0)
+            weights_water = torch.cat([ensure_column(w) for w in water_weights_chunks], dim=0)
             rgb_water = torch.cat(water_rgb_chunks, dim=0)
             ray_indices_water = torch.cat(water_indices_chunks, dim=0)
             depth_mid_water = torch.cat(water_depth_chunks, dim=0)
 
-            weights_all = torch.cat([weights_all, weights_water], dim=0)
+            weights_all = torch.cat([ensure_column(weights_all), ensure_column(weights_water)], dim=0)
             rgb_all = torch.cat([rgb_all, rgb_water], dim=0)
             ray_indices_all = torch.cat([ray_indices_all, ray_indices_water], dim=0)
             depth_all = torch.cat([depth_all, depth_mid_water], dim=0)
