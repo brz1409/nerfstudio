@@ -77,6 +77,9 @@ class TwoMediaNeRFModel(Model):
         self.air_field: Optional[NeRFField] = None
         self.water_field: Optional[NeRFField] = None
         self.temporal_distortion = None
+        self._air_sample_count: int = 0
+        self._water_sample_count: int = 0
+        self._two_media_banner_logged: bool = False
 
         self._dataparser_transform: Optional[Tensor] = kwargs.get("dataparser_transform")
         self._dataparser_scale: float = float(kwargs.get("dataparser_scale", 1.0))
@@ -128,6 +131,9 @@ class TwoMediaNeRFModel(Model):
             "TwoMediaNeRF sampling uses a shared nerfacc occupancy grid "
             f"(render_step_size={render_step_str}, levels={self.config.grid_levels}, "
             f"resolution={self.config.grid_resolution})."
+        )
+        CONSOLE.log(
+            "TwoMediaNeRFModel initialised: tracking air/water sample counts for training diagnostics."
         )
         self._nerfacc_sampling_logged = False
 
@@ -234,6 +240,14 @@ class TwoMediaNeRFModel(Model):
                 if step == 0:
                     rstep = self.config.render_step_size if self.config.render_step_size is not None else -1.0
                     global_writer.put_scalar(name=WriterEventName.NERFACC_RENDER_STEP_SIZE, scalar=float(rstep), step=0)
+                global_writer.put_scalar("TwoMedia/AirSamples", float(self._air_sample_count), step)
+                global_writer.put_scalar("TwoMedia/WaterSamples", float(self._water_sample_count), step)
+                if not self._two_media_banner_logged and self._water_sample_count > 0:
+                    CONSOLE.log(
+                        "TwoMediaNeRF training detected active water branch: "
+                        f"air_samples={self._air_sample_count}, water_samples={self._water_sample_count}."
+                    )
+                    self._two_media_banner_logged = True
             except Exception:  # pragma: no cover - logging should never break training
                 pass
 
@@ -556,21 +570,22 @@ class TwoMediaNeRFModel(Model):
         rgb_air = field_air[FieldHeadNames.RGB]
         depth_mid_air = ((ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0)[..., 0]
 
-        weights_all = ensure_column(weights_air)
-        rgb_all = rgb_air
-        ray_indices_all = ray_indices_air
-        depth_all = depth_mid_air
+        weights_segments: List[Tensor] = [weights_air]
+        rgb_segments: List[Tensor] = [rgb_air]
+        ray_index_segments: List[Tensor] = [ray_indices_air]
+        depth_segments: List[Tensor] = [depth_mid_air]
 
         if water_weights_chunks:
-            weights_water = torch.cat([ensure_column(w) for w in water_weights_chunks], dim=0)
-            rgb_water = torch.cat(water_rgb_chunks, dim=0)
-            ray_indices_water = torch.cat(water_indices_chunks, dim=0)
-            depth_mid_water = torch.cat(water_depth_chunks, dim=0)
+            for chunk in water_weights_chunks:
+                weights_segments.append(ensure_column(chunk))
+            rgb_segments.extend(water_rgb_chunks)
+            ray_index_segments.extend(water_indices_chunks)
+            depth_segments.extend(water_depth_chunks)
 
-            weights_all = torch.cat([ensure_column(weights_all), ensure_column(weights_water)], dim=0)
-            rgb_all = torch.cat([rgb_all, rgb_water], dim=0)
-            ray_indices_all = torch.cat([ray_indices_all, ray_indices_water], dim=0)
-            depth_all = torch.cat([depth_all, depth_mid_water], dim=0)
+        weights_all = torch.cat(weights_segments, dim=0)
+        rgb_all = torch.cat(rgb_segments, dim=0)
+        ray_indices_all = torch.cat(ray_index_segments, dim=0)
+        depth_all = torch.cat(depth_segments, dim=0)
 
         if weights_all.numel() > 0 and ray_indices_all.numel() > 0:
             sort_perm = torch.argsort(ray_indices_all)
@@ -578,6 +593,9 @@ class TwoMediaNeRFModel(Model):
             rgb_all = rgb_all[sort_perm]
             ray_indices_all = ray_indices_all[sort_perm]
             depth_all = depth_all[sort_perm]
+
+        self._air_sample_count = int(weights_air.shape[0])
+        self._water_sample_count = sum(int(w.shape[0]) for w in water_weights_chunks)
 
         packed_info_all = nerfacc.pack_info(ray_indices_all, num_rays)
         try:
@@ -609,6 +627,12 @@ class TwoMediaNeRFModel(Model):
         if "num_samples_per_ray" in outputs:
             metrics_dict["nerfacc_active"] = torch.tensor(1.0, device=self.device)
             metrics_dict["nerfacc_num_samples_per_batch"] = outputs["num_samples_per_ray"].sum()
+        metrics_dict["two_media_air_samples"] = torch.tensor(
+            float(self._air_sample_count), device=self.device
+        )
+        metrics_dict["two_media_water_samples"] = torch.tensor(
+            float(self._water_sample_count), device=self.device
+        )
         return metrics_dict
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
