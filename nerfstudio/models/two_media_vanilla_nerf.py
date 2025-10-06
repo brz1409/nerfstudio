@@ -335,8 +335,8 @@ class TwoMediaNeRFModel(Model):
         weights = torch.cat([weights_air_fine, weights_water_fine], dim=-2)
         rgbs = torch.cat([rgb_air_fine, rgb_water_fine], dim=-2)
 
-        rgb = (weights * rgbs).sum(dim=-2)
-        accumulation = weights.sum(dim=-2)
+        rgb = self.renderer_rgb(rgb=rgbs, weights=weights)
+        accumulation = self.renderer_accumulation(weights)
 
         # Depth
         t_mids_air = (ray_samples_air_fine.frustums.starts + ray_samples_air_fine.frustums.ends) / 2.0
@@ -350,10 +350,6 @@ class TwoMediaNeRFModel(Model):
 
         t_mids_all = torch.cat([t_mids_air, t_mids_water], dim=-2)
         depth = (weights * t_mids_all).sum(dim=-2) / (accumulation + 1e-10)
-
-        # Background
-        if self.config.background_color == "white":
-            rgb = rgb + (1.0 - accumulation)
 
         return {
             "rgb": rgb,
@@ -371,8 +367,14 @@ class TwoMediaNeRFModel(Model):
         return param_groups
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, Tensor]:
-        image = batch["image"].to(outputs["rgb"].device)
-        rgb_loss = self.rgb_loss(image, outputs["rgb"])
+        device = outputs["rgb"].device
+        image = batch["image"].to(device)
+        pred_rgb, gt_rgb = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+        rgb_loss = self.rgb_loss(gt_rgb, pred_rgb)
         return {"rgb_loss": rgb_loss}
 
     def get_metrics_dict(self, outputs, batch):
@@ -382,6 +384,7 @@ class TwoMediaNeRFModel(Model):
         self, outputs: Dict[str, Tensor], batch: Dict[str, Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, Tensor]]:
         image = batch["image"].to(outputs["rgb"].device)
+        image = self.renderer_rgb.blend_background(image)
         rgb = outputs["rgb"]
         acc = colormaps.apply_colormap(outputs["accumulation"])
         depth = colormaps.apply_depth_colormap(outputs["depth"], accumulation=outputs["accumulation"])
