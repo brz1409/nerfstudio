@@ -82,6 +82,14 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     use_gradient_scaling: bool = False
     """Apply distance-based gradient scaling."""
 
+    # Physics-based features
+    use_independent_water_sampling: bool = True
+    """Water importance sampling independent of air transmittance (Fix #4)."""
+    use_fresnel_constraints: bool = True
+    """Apply Fresnel reflectance constraints to air/water balance (Fix #5)."""
+    fresnel_loss_weight: float = 0.1
+    """Weight for Fresnel constraint loss term."""
+
 
 class TwoMediaNeRFModel(Model):
     """Two-medium NeRF using stratified sampling for robust memory-safe training."""
@@ -269,6 +277,43 @@ class TwoMediaNeRFModel(Model):
             offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
         ray_samples.frustums.set_offsets(offsets)
 
+    def _compute_fresnel_reflectance(self, directions: Tensor, hits_water: Tensor) -> Tensor:
+        """
+        Compute Fresnel reflectance for air→water interface using Schlick approximation.
+
+        Args:
+            directions: Ray directions (num_rays, 3)
+            hits_water: Boolean mask of rays that hit water (num_rays,)
+
+        Returns:
+            Fresnel reflectance coefficient R ∈ [R0, 1.0] where R0 ≈ 0.02 for air/water
+        """
+        num_rays = len(directions)
+        device = directions.device
+
+        # Initialize with zeros (no reflection for rays that don't hit water)
+        fresnel_R = torch.zeros(num_rays, device=device)
+
+        if not hits_water.any():
+            return fresnel_R
+
+        # Compute incident angle (angle between ray and surface normal)
+        # cos_theta = |ray · normal| (absolute value since we want acute angle)
+        cos_theta = torch.abs((directions @ self.water_plane_normal.T).squeeze(-1))
+
+        # Fresnel reflectance at normal incidence (Snell's law)
+        # R0 = ((n1 - n2) / (n1 + n2))^2
+        n1 = self.config.air_refractive_index
+        n2 = self.config.water_refractive_index
+        R0 = ((n1 - n2) / (n1 + n2)) ** 2  # ≈ 0.02 for air (1.0) → water (1.333)
+
+        # Schlick's approximation: R(θ) = R0 + (1 - R0)(1 - cos θ)^5
+        # At normal incidence (θ=0°, cos=1): R = R0 ≈ 2%
+        # At grazing incidence (θ=90°, cos=0): R → 100%
+        fresnel_R = R0 + (1.0 - R0) * torch.pow(1.0 - cos_theta, 5)
+
+        return fresnel_R
+
     def _render_segment(
         self,
         field: NeRFField,
@@ -414,9 +459,21 @@ class TwoMediaNeRFModel(Model):
         ray_samples_water_fine: Optional[RaySamples] = None
 
         if hits_water.any() and water_bundle is not None and ray_samples_water_coarse is not None:
-            ray_samples_water_fine = self.sampler_pdf(
-                water_bundle, ray_samples_water_coarse, weights_water_coarse.detach()
-            )
+            # Fix #4: Independent water importance sampling
+            if self.config.use_independent_water_sampling:
+                # Re-evaluate water field to get pure densities (before air transmittance multiplication)
+                field_outputs_water = self.water_field_coarse(ray_samples_water_coarse)
+                densities_water_pure = field_outputs_water[FieldHeadNames.DENSITY]
+                weights_water_pure = ray_samples_water_coarse.get_weights(densities_water_pure)
+
+                ray_samples_water_fine = self.sampler_pdf(
+                    water_bundle, ray_samples_water_coarse, weights_water_pure.detach()
+                )
+            else:
+                # Use air-transmittance-modified weights (original behavior)
+                ray_samples_water_fine = self.sampler_pdf(
+                    water_bundle, ray_samples_water_coarse, weights_water_coarse.detach()
+                )
             self._apply_temporal_distortion(ray_samples_water_fine)
             weights_water_fine, rgb_water_fine = self._render_segment(
                 self.water_field_fine, ray_samples_water_fine
@@ -451,6 +508,20 @@ class TwoMediaNeRFModel(Model):
             t_water,
         )
 
+        # Export air accumulation for diagnostics and loss
+        accumulation_air_fine = weights_air_fine.sum(dim=-2)
+
+        # Fix #3: Compute direct water rendering (ignore air transmittance)
+        if hits_water.any():
+            # Re-normalize water weights as if air was fully transparent
+            weights_water_renorm = weights_water_fine / (weights_water_fine.sum(dim=-2, keepdim=True) + 1e-10)
+            rgb_water_direct = (rgb_water_fine * weights_water_renorm).sum(dim=-2)
+        else:
+            rgb_water_direct = torch.zeros_like(rgb_fine)
+
+        # Fix #5: Compute Fresnel reflectance for physics-based constraints
+        fresnel_R = self._compute_fresnel_reflectance(directions, hits_water)
+
         return {
             "rgb_coarse": rgb_coarse,
             "rgb_fine": rgb_fine,
@@ -461,6 +532,11 @@ class TwoMediaNeRFModel(Model):
             "rgb": rgb_fine,
             "accumulation": accumulation_fine,
             "depth": depth_fine,
+            # Additional outputs for physics-based losses
+            "accumulation_air_fine": accumulation_air_fine,
+            "rgb_water_direct": rgb_water_direct,
+            "hits_water": hits_water,
+            "fresnel_R": fresnel_R,
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -491,6 +567,42 @@ class TwoMediaNeRFModel(Model):
         rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
 
         loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+
+        # Fix #3: Direct water supervision - water learns directly from GT pixels
+        hits_water = outputs.get("hits_water")
+        if hits_water is not None and hits_water.any():
+            image_flat = image.reshape(-1, 3)
+            water_direct_flat = outputs["rgb_water_direct"].reshape(-1, 3)
+            hits_water_flat = hits_water.reshape(-1)
+
+            # Loss only on pixels where ray hits water
+            water_gt = image_flat[hits_water_flat]
+            water_pred = water_direct_flat[hits_water_flat]
+
+            # Blend background for direct water rendering
+            water_pred_bg, water_gt_bg = self.renderer_rgb.blend_background_for_loss_computation(
+                pred_image=water_pred,
+                pred_accumulation=torch.ones_like(water_pred[..., :1]),  # Assume full opacity
+                gt_image=water_gt,
+            )
+
+            rgb_loss_water_direct = self.rgb_loss(water_gt_bg, water_pred_bg)
+            loss_dict["rgb_loss_water_direct"] = rgb_loss_water_direct * 0.2
+        else:
+            loss_dict["rgb_loss_water_direct"] = torch.tensor(0.0, device=device)
+
+        # Fix #5: Fresnel constraint - air accumulation should match physical reflectance
+        if self.config.use_fresnel_constraints and hits_water is not None and hits_water.any():
+            air_accumulation = outputs["accumulation_air_fine"][hits_water.squeeze()]
+            target_fresnel = outputs["fresnel_R"][hits_water.squeeze()]
+
+            # MSE loss: encourage air accumulation to match Fresnel reflectance
+            # This guides the network to learn that air contribution is limited by physics
+            fresnel_constraint_loss = F.mse_loss(air_accumulation, target_fresnel)
+            loss_dict["fresnel_constraint"] = fresnel_constraint_loss * self.config.fresnel_loss_weight
+        else:
+            loss_dict["fresnel_constraint"] = torch.tensor(0.0, device=device)
+
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
