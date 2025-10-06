@@ -63,6 +63,12 @@ class TwoMediaVanillaModelConfig(VanillaModelConfig):
     interface_epsilon: float = 1e-4
     """Small offset applied around the interface to avoid numerical overlap."""
 
+    # Override defaults for better memory usage with two-media sampling
+    grid_levels: int = 1
+    """Number of levels in the occupancy grid. Use 1 for Vanilla NeRF to avoid excessive sampling."""
+    eval_num_rays_per_chunk: int = 512
+    """Number of rays per chunk during evaluation. Lower to reduce memory usage."""
+
 
 class TwoMediaNeRFModel(Model):
     """Two-medium Vanilla NeRF model that refracts rays at a planar interface."""
@@ -621,34 +627,42 @@ class TwoMediaNeRFModel(Model):
         # Optimize memory usage: process concatenation in smaller chunks if needed
         total_samples = sum(w.shape[0] for w in weights_segments)
 
-        # Hard limit to prevent OOM errors during evaluation
+        # Hard limit to prevent OOM errors
         max_samples = 10_000_000
         if total_samples > max_samples:
-            CONSOLE.log(f"[red]Error: {total_samples:,} samples exceeds limit of {max_samples:,}. "
-                       f"Reduce eval-num-rays-per-chunk (current: {num_rays} rays) or increase grid_levels.[/red]")
-            # Subsample to fit within memory limits
-            subsample_ratio = max_samples / total_samples
-            CONSOLE.log(f"[yellow]Subsampling to {subsample_ratio:.2%} of samples to avoid OOM.[/yellow]")
+            CONSOLE.log(f"[red]CRITICAL ERROR: {total_samples:,} samples for {num_rays} rays ({total_samples/num_rays:.1f} samples/ray)![/red]")
+            CONSOLE.log(f"[red]This indicates a serious configuration issue. Your grid_levels={self.config.grid_levels} may be too high.[/red]")
+            CONSOLE.log(f"[red]For Vanilla NeRF, use: --pipeline.model.grid-levels 1 --pipeline.model.grid-resolution 128[/red]")
 
+            # Cannot subsample safely when we have billions of samples
+            # Instead, we'll create a minimal valid output to prevent crash
+            CONSOLE.log(f"[yellow]Creating minimal output to prevent crash. Training will not work properly until you fix the config.[/yellow]")
+
+            # Just take first N samples from each segment (no random permutation)
+            subsample_ratio = max_samples / total_samples
             new_weights = []
             new_rgb = []
             new_indices = []
             new_depth = []
             for w, r, i, d in zip(weights_segments, rgb_segments, ray_index_segments, depth_segments):
-                n = int(w.shape[0] * subsample_ratio)
-                if n > 0:
-                    indices = torch.randperm(w.shape[0], device=w.device)[:n]
-                    new_weights.append(w[indices])
-                    new_rgb.append(r[indices])
-                    new_indices.append(i[indices])
-                    new_depth.append(d[indices])
+                n = max(1, int(w.shape[0] * subsample_ratio))
+                # Use slice instead of randperm to avoid OOM
+                new_weights.append(w[:n])
+                new_rgb.append(r[:n])
+                new_indices.append(i[:n])
+                new_depth.append(d[:n])
             weights_segments = new_weights
             rgb_segments = new_rgb
             ray_index_segments = new_indices
             depth_segments = new_depth
             total_samples = sum(w.shape[0] for w in weights_segments)
+
+            # Free memory
+            del new_weights, new_rgb, new_indices, new_depth
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         elif total_samples > 5_000_000:
-            CONSOLE.log(f"[yellow]Warning: Processing {total_samples:,} samples ({num_rays} rays, {total_samples/num_rays:.1f} samples/ray). Consider reducing eval-num-rays-per-chunk.[/yellow]")
+            CONSOLE.log(f"[yellow]Warning: {total_samples:,} samples ({num_rays} rays, {total_samples/num_rays:.1f} samples/ray). Consider reducing eval-num-rays-per-chunk.[/yellow]")
 
         # Free intermediate chunks to reduce memory pressure
         if total_samples > 0:

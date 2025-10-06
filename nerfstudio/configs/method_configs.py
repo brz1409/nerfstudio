@@ -378,7 +378,6 @@ method_configs["two-media-vanilla-nerf"] = TrainerConfig(
         ),
         model=TwoMediaVanillaModelConfig(
             _target=TwoMediaNeRFModel,
-            eval_num_rays_per_chunk=512,
         ),
     ),
     optimizers={
