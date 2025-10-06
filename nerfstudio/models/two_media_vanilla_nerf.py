@@ -403,13 +403,9 @@ class TwoMediaNeRFModel(Model):
         param_groups = {}
         if self.air_field_coarse is None or self.air_field_fine is None or self.water_field_coarse is None or self.water_field_fine is None:
             raise ValueError("populate_modules() must be called before get_param_groups")
-        # Group all 4 fields together like vanilla_nerf does
-        param_groups["fields"] = (
-            list(self.air_field_coarse.parameters()) +
-            list(self.air_field_fine.parameters()) +
-            list(self.water_field_coarse.parameters()) +
-            list(self.water_field_fine.parameters())
-        )
+        # Keep separate optimizers for air and water branches to match TrainerConfig
+        param_groups["air_field"] = list(self.air_field_coarse.parameters()) + list(self.air_field_fine.parameters())
+        param_groups["water_field"] = list(self.water_field_coarse.parameters()) + list(self.water_field_fine.parameters())
         return param_groups
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, Tensor]:
