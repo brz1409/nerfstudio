@@ -68,6 +68,10 @@ class TwoMediaVanillaModelConfig(VanillaModelConfig):
     """Number of levels in the occupancy grid. Use 1 for Vanilla NeRF to avoid excessive sampling."""
     eval_num_rays_per_chunk: int = 512
     """Number of rays per chunk during evaluation. Lower to reduce memory usage."""
+    alpha_thre: float = 0.01
+    """Alpha threshold for volume rendering. Lower values = more samples. Default 0.01 for vanilla NeRF."""
+    grid_resolution: int = 256
+    """Resolution of the occupancy grid. Higher = more accurate but slower. 256 is a good balance."""
 
 
 class TwoMediaNeRFModel(Model):
@@ -86,6 +90,7 @@ class TwoMediaNeRFModel(Model):
         self._air_sample_count: int = 0
         self._water_sample_count: int = 0
         self._two_media_banner_logged: bool = False
+        self._current_training_step: int = 0
 
         self._dataparser_transform: Optional[Tensor] = kwargs.get("dataparser_transform")
         self._dataparser_scale: float = float(kwargs.get("dataparser_scale", 1.0))
@@ -116,9 +121,24 @@ class TwoMediaNeRFModel(Model):
         )
 
         self.scene_aabb = Parameter(self.scene_box.aabb.flatten(), requires_grad=False)
+
+        # Log scene dimensions for debugging
+        scene_size = self.scene_aabb[3:] - self.scene_aabb[:3]
+        scene_diagonal = torch.sqrt((scene_size ** 2).sum()).item()
+        CONSOLE.log(f"Scene box: min={self.scene_aabb[:3].cpu().numpy()}, max={self.scene_aabb[3:].cpu().numpy()}")
+        CONSOLE.log(f"Scene size: {scene_size.cpu().numpy()}, diagonal={scene_diagonal:.4f}")
+
         if self.config.render_step_size is None:
             # Auto step size: ~1000 samples in the base level grid.
-            self.config.render_step_size = ((self.scene_aabb[3:] - self.scene_aabb[:3]) ** 2).sum().sqrt().item() / 1000
+            auto_step_size = scene_diagonal / 1000
+            self.config.render_step_size = auto_step_size
+            CONSOLE.log(f"Auto-computed render_step_size: {auto_step_size:.6f}")
+
+            # For very large scenes, use a more conservative step size
+            if auto_step_size > 0.1:
+                self.config.render_step_size = 0.01
+                CONSOLE.log(f"[yellow]Scene is very large (diagonal={scene_diagonal:.2f}). "
+                           f"Overriding auto step size {auto_step_size:.4f} -> 0.01 to prevent sampling issues.[/yellow]")
 
         self.occupancy_grid = nerfacc.OccGridEstimator(
             roi_aabb=self.scene_aabb,
@@ -139,14 +159,26 @@ class TwoMediaNeRFModel(Model):
             f"resolution={self.config.grid_resolution})."
         )
 
-        # Warn if grid_levels is too low
+        # Calculate expected samples per ray
+        voxel_size = scene_diagonal / self.config.grid_resolution
+        samples_per_ray_estimate = scene_diagonal / render_step
+        CONSOLE.log(f"Voxel size: {voxel_size:.6f}, Expected ~{samples_per_ray_estimate:.0f} samples/ray")
+
+        # Warn if grid_levels is problematic
         if self.config.grid_levels < 1:
             CONSOLE.log("[yellow]Warning: grid_levels < 1 may cause sampling issues. Recommended: 1 for Vanilla NeRF.[/yellow]")
+        elif self.config.grid_levels > 2:
+            CONSOLE.log(f"[yellow]Warning: grid_levels={self.config.grid_levels} is very high for Vanilla NeRF. "
+                       f"This may cause excessive sampling. Recommended: 1-2.[/yellow]")
 
-        # Warn if render_step_size is very large
-        if render_step is not None and render_step > 0.1:
-            CONSOLE.log(f"[yellow]Warning: Large render_step_size ({render_step:.4f}) may cause very few samples. "
-                       f"Consider smaller step size or larger grid_resolution.[/yellow]")
+        # Warn if render_step_size seems problematic
+        if render_step is not None:
+            if render_step > voxel_size:
+                CONSOLE.log(f"[yellow]Warning: render_step_size ({render_step:.4f}) > voxel_size ({voxel_size:.4f}). "
+                           f"This will cause very few samples. Try --pipeline.model.render-step-size {voxel_size/2:.6f}[/yellow]")
+            elif samples_per_ray_estimate > 10000:
+                CONSOLE.log(f"[yellow]Warning: Expected {samples_per_ray_estimate:.0f} samples/ray is very high. "
+                           f"Try larger --pipeline.model.render-step-size (current: {render_step:.6f})[/yellow]")
 
         CONSOLE.log(
             "TwoMediaNeRFModel initialised: tracking air/water sample counts for training diagnostics."
@@ -237,6 +269,9 @@ class TwoMediaNeRFModel(Model):
 
     def get_training_callbacks(self, training_callback_attributes):
         def update_occupancy_grid(step: int):
+            # Track training step for warmup logic
+            self._current_training_step = step
+
             assert self.config.render_step_size is not None
 
             # Wrapper to debug density values
@@ -420,6 +455,16 @@ class TwoMediaNeRFModel(Model):
         )
 
         render_step = self.config.render_step_size if self.config.render_step_size is not None else 1e-3
+
+        # Warmup: Use lower alpha threshold for first 500 steps to help occupancy grid populate
+        current_step = getattr(self, '_current_training_step', 0)
+        alpha_thre = self.config.alpha_thre
+        if current_step < 500:
+            alpha_thre = min(alpha_thre, 0.001)  # Very permissive during warmup
+            if current_step == 0 and not hasattr(self, '_warmup_logged'):
+                CONSOLE.log(f"[cyan]Warmup mode active for first 500 steps: using alpha_thre={alpha_thre:.4f} instead of {self.config.alpha_thre:.4f}[/cyan]")
+                self._warmup_logged = True
+
         # WICHTIG: Kein torch.no_grad() hier! Das verhindert, dass nerfacc Samples generiert.
         # Die density_fn benötigt Gradienten für das Occupancy Grid Update.
         ray_samples_air, ray_indices_air = self.sampler(
@@ -427,7 +472,7 @@ class TwoMediaNeRFModel(Model):
             near_plane=near_plane,
             far_plane=far_plane,
             render_step_size=render_step,
-            alpha_thre=self.config.alpha_thre,
+            alpha_thre=alpha_thre,
             cone_angle=self.config.cone_angle,
         )
 
@@ -509,7 +554,7 @@ class TwoMediaNeRFModel(Model):
                     near_plane=0.0,
                     far_plane=far_plane,
                     render_step_size=render_step,
-                    alpha_thre=self.config.alpha_thre,
+                    alpha_thre=alpha_thre,
                     cone_angle=self.config.cone_angle,
                 )
 
@@ -573,7 +618,7 @@ class TwoMediaNeRFModel(Model):
                     near_plane=near_plane,
                     far_plane=far_plane,
                     render_step_size=render_step,
-                    alpha_thre=self.config.alpha_thre,
+                    alpha_thre=alpha_thre,
                     cone_angle=self.config.cone_angle,
                 )
 
