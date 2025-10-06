@@ -290,10 +290,23 @@ class TwoMediaNeRFModel(Model):
         t_air_far = torch.where(hits_water, t_water - eps, far)
         t_air_far = torch.clamp(t_air_far, min=near + eps)
 
-        # Uniform sampling
-        t_starts_air, t_ends_air = self.sampler_uniform.generate_ray_samples(ray_bundle, num_samples=self.config.num_coarse_samples)
-        t_starts_air = torch.clamp(t_starts_air, min=near.unsqueeze(-1), max=t_air_far.unsqueeze(-1))
-        t_ends_air = torch.clamp(t_ends_air, min=near.unsqueeze(-1), max=t_air_far.unsqueeze(-1))
+        # Uniform sampling within the air segment bounds.
+        air_fars = torch.maximum(t_air_far, near + eps)
+        air_bundle = RayBundle(
+            origins=origins,
+            directions=directions,
+            pixel_area=ray_bundle.pixel_area,
+            camera_indices=ray_bundle.camera_indices,
+            nears=near.unsqueeze(-1),
+            fars=air_fars.unsqueeze(-1),
+            metadata=ray_bundle.metadata,
+            times=ray_bundle.times,
+        )
+        ray_samples_air_coarse = self.sampler_uniform(
+            air_bundle, num_samples=self.config.num_coarse_samples
+        )
+        t_starts_air = ray_samples_air_coarse.frustums.starts[..., 0]
+        t_ends_air = ray_samples_air_coarse.frustums.ends[..., 0]
 
         weights_air_coarse, rgb_air_coarse, _ = self._render_segment(
             self.air_field_coarse, ray_bundle, t_starts_air, t_ends_air
@@ -305,7 +318,7 @@ class TwoMediaNeRFModel(Model):
             entry_points = origins + directions * t_water.unsqueeze(-1)
             refracted_dirs = self._compute_refraction(directions)
             water_origins = entry_points + refracted_dirs * eps
-            remaining_dist = far - t_water
+            remaining_dist = torch.clamp(far - t_water, min=0.0)
 
             water_bundle = RayBundle(
                 origins=water_origins,
@@ -314,9 +327,15 @@ class TwoMediaNeRFModel(Model):
                 camera_indices=ray_bundle.camera_indices,
                 nears=torch.zeros((num_rays, 1), device=device),
                 fars=remaining_dist.unsqueeze(-1),
+                metadata=ray_bundle.metadata,
+                times=ray_bundle.times,
             )
 
-            t_starts_water, t_ends_water = self.sampler_uniform.generate_ray_samples(water_bundle, num_samples=self.config.num_coarse_samples)
+            ray_samples_water_coarse = self.sampler_uniform(
+                water_bundle, num_samples=self.config.num_coarse_samples
+            )
+            t_starts_water = ray_samples_water_coarse.frustums.starts[..., 0]
+            t_ends_water = ray_samples_water_coarse.frustums.ends[..., 0]
             weights_water_coarse, rgb_water_coarse, _ = self._render_segment(
                 self.water_field_coarse, water_bundle, t_starts_water, t_ends_water
             )
