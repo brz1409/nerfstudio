@@ -132,6 +132,16 @@ class TwoMediaNeRFModel(Model):
             f"(render_step_size={render_step_str}, levels={self.config.grid_levels}, "
             f"resolution={self.config.grid_resolution})."
         )
+
+        # Warn if grid_levels is too low
+        if self.config.grid_levels < 1:
+            CONSOLE.log("[yellow]Warning: grid_levels < 1 may cause sampling issues. Recommended: 1 for Vanilla NeRF.[/yellow]")
+
+        # Warn if render_step_size is very large
+        if render_step is not None and render_step > 0.1:
+            CONSOLE.log(f"[yellow]Warning: Large render_step_size ({render_step:.4f}) may cause very few samples. "
+                       f"Consider smaller step size or larger grid_resolution.[/yellow]")
+
         CONSOLE.log(
             "TwoMediaNeRFModel initialised: tracking air/water sample counts for training diagnostics."
         )
@@ -222,10 +232,20 @@ class TwoMediaNeRFModel(Model):
     def get_training_callbacks(self, training_callback_attributes):
         def update_occupancy_grid(step: int):
             assert self.config.render_step_size is not None
+
+            # Wrapper to debug density values
+            def occ_eval_fn_debug(x):
+                densities = self._evaluate_density(x)
+                if step % 100 == 0 and step > 0:
+                    mean_density = densities.mean().item()
+                    max_density = densities.max().item()
+                    nonzero = (densities > 1e-6).float().mean().item()
+                    CONSOLE.log(f"[Step {step}] Occupancy grid eval: mean_density={mean_density:.6f}, max_density={max_density:.6f}, nonzero_ratio={nonzero:.2%}")
+                return densities * (self.config.render_step_size if self.config.render_step_size is not None else 1.0)
+
             self.occupancy_grid.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self._evaluate_density(x)
-                * (self.config.render_step_size if self.config.render_step_size is not None else 1.0),
+                occ_eval_fn=occ_eval_fn_debug,
             )
 
         def log_nerfacc_metrics(step: int):
@@ -237,6 +257,18 @@ class TwoMediaNeRFModel(Model):
                         scalar=float(self._nerfacc_last_samples_sum),
                         step=step,
                     )
+
+                    # Warn if samples are very low
+                    if step > 100 and step % 100 == 0 and self._nerfacc_last_samples_sum < 100:
+                        CONSOLE.log(
+                            f"[yellow]Step {step}: Very low sample count ({self._nerfacc_last_samples_sum:.1f}). "
+                            "This may indicate:\n"
+                            "  1. Densities are too low (check occupancy grid debug logs)\n"
+                            "  2. alpha_thre is too high (try --pipeline.model.alpha-thre 0.001)\n"
+                            "  3. render_step_size is too large (try --pipeline.model.render-step-size 0.01)\n"
+                            "  4. Scene box is too large or misaligned[/yellow]"
+                        )
+
                 if step == 0:
                     rstep = self.config.render_step_size if self.config.render_step_size is not None else -1.0
                     global_writer.put_scalar(name=WriterEventName.NERFACC_RENDER_STEP_SIZE, scalar=float(rstep), step=0)
