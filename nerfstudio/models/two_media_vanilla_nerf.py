@@ -30,14 +30,16 @@ from torch import Tensor
 from torch.nn import Parameter
 
 from nerfstudio.cameras.rays import RayBundle, RaySamples
+from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
+from nerfstudio.field_components.temporal_distortions import TemporalDistortionKind
 from nerfstudio.fields.vanilla_nerf_field import NeRFField
-from nerfstudio.model_components.losses import MSELoss
+from nerfstudio.model_components.losses import MSELoss, scale_gradients_by_distance_squared
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.models.base_model import Model, ModelConfig
-from nerfstudio.utils import colormaps
+from nerfstudio.utils import colormaps, misc
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -69,11 +71,35 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     background_color: Literal["random", "last_sample", "black", "white"] = "white"
     """Background color."""
 
+    # Optional features aligned with classic vanilla NeRF
+    enable_temporal_distortion: bool = False
+    """Specifies whether to include temporal distortion."""
+    temporal_distortion_params: Dict[str, Any] = to_immutable_dict({"kind": TemporalDistortionKind.DNERF})
+    """Parameters for temporal distortion instantiation."""
+    use_gradient_scaling: bool = False
+    """Apply distance-based gradient scaling."""
+
 
 class TwoMediaNeRFModel(Model):
     """Two-medium NeRF using stratified sampling for robust memory-safe training."""
 
     config: TwoMediaVanillaModelConfig
+
+    def __init__(
+        self,
+        config: TwoMediaVanillaModelConfig,
+        **kwargs,
+    ) -> None:
+        self.air_field_coarse: Optional[NeRFField] = None
+        self.air_field_fine: Optional[NeRFField] = None
+        self.water_field_coarse: Optional[NeRFField] = None
+        self.water_field_fine: Optional[NeRFField] = None
+        self.temporal_distortion = None
+
+        super().__init__(
+            config=config,
+            **kwargs,
+        )
 
     def populate_modules(self) -> None:
         """Initialize fields and samplers."""
@@ -100,7 +126,7 @@ class TwoMediaNeRFModel(Model):
         # Renderers
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer(method="expected")
+        self.renderer_depth = DepthRenderer()
 
         # Loss
         self.rgb_loss = MSELoss()
@@ -113,6 +139,13 @@ class TwoMediaNeRFModel(Model):
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
+
+        # Temporal distortion (optional)
+        self.temporal_distortion = None
+        if getattr(self.config, "enable_temporal_distortion", False):
+            params = dict(self.config.temporal_distortion_params)
+            kind = params.pop("kind")
+            self.temporal_distortion = kind.to_temporal_distortion(params)
 
         # Setup water interface geometry
         self._setup_water_interface()
@@ -197,6 +230,16 @@ class TwoMediaNeRFModel(Model):
 
         return F.normalize(refracted, dim=-1)
 
+    def _apply_temporal_distortion(self, ray_samples: Optional[RaySamples]) -> None:
+        """Apply temporal distortion offsets in-place if enabled."""
+        if self.temporal_distortion is None or ray_samples is None:
+            return
+
+        offsets = None
+        if ray_samples.times is not None:
+            offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
+        ray_samples.frustums.set_offsets(offsets)
+
     def _render_segment(
         self,
         field: NeRFField,
@@ -210,6 +253,8 @@ class TwoMediaNeRFModel(Model):
             rgb: (num_rays, num_samples, 3) RGB colors
         """
         field_outputs = field(ray_samples)
+        if self.config.use_gradient_scaling:
+            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
         densities = field_outputs[FieldHeadNames.DENSITY]  # (num_rays, num_samples, 1)
         rgb = field_outputs[FieldHeadNames.RGB]  # (num_rays, num_samples, 3)
@@ -218,10 +263,33 @@ class TwoMediaNeRFModel(Model):
 
         return weights, rgb
 
+    def _expected_depth(
+        self,
+        weights: Tensor,
+        accumulation: Tensor,
+        ray_samples_air: RaySamples,
+        ray_samples_water: Optional[RaySamples],
+        t_water: Tensor,
+    ) -> Tensor:
+        """Compute expected depth combining air and water segments."""
+
+        t_mids_air = (ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0
+
+        if ray_samples_water is not None:
+            t_mids_water = (ray_samples_water.frustums.starts + ray_samples_water.frustums.ends) / 2.0
+            t_mids_water = t_mids_water + t_water.view(-1, 1, 1)
+        else:
+            t_mids_water = torch.zeros(
+                (weights.shape[0], 0, 1), device=weights.device, dtype=weights.dtype
+            )
+
+        t_mids_all = torch.cat([t_mids_air, t_mids_water], dim=-2)
+        depth = (weights * t_mids_all).sum(dim=-2) / (accumulation + 1e-10)
+        return depth
+
     def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Tensor]:
         """Forward pass with hierarchical sampling through two media."""
 
-        # Flatten ray bundle
         ray_bundle = ray_bundle.flatten()
         num_rays = len(ray_bundle)
         device = ray_bundle.origins.device
@@ -229,11 +297,9 @@ class TwoMediaNeRFModel(Model):
         origins = ray_bundle.origins
         directions = F.normalize(ray_bundle.directions, dim=-1)
 
-        # Near/far planes
         near = ray_bundle.nears[..., 0] if ray_bundle.nears is not None else torch.zeros(num_rays, device=device)
         far = ray_bundle.fars[..., 0] if ray_bundle.fars is not None else torch.full((num_rays,), 10.0, device=device)
 
-        # Find water surface intersection
         eps = self.config.interface_epsilon
         signed_dist = self._signed_distance_to_water(origins)
         denom = (directions @ self.water_plane_normal.T).squeeze(-1)
@@ -241,19 +307,17 @@ class TwoMediaNeRFModel(Model):
         t_water = torch.where(
             torch.abs(denom) > 1e-6,
             -signed_dist / denom,
-            far + 1.0  # No intersection
+            far + 1.0,
         )
 
         starts_above = signed_dist > eps
         hits_water = (t_water > near) & (t_water < far) & starts_above
 
-        # ===== COARSE PASS =====
-        # Air segment
+        # Coarse sampling (air)
         t_air_far = torch.where(hits_water, t_water - eps, far)
         t_air_far = torch.clamp(t_air_far, min=near + eps)
-
-        # Uniform sampling within the air segment bounds.
         air_fars = torch.maximum(t_air_far, near + eps)
+
         air_bundle = RayBundle(
             origins=origins,
             directions=directions,
@@ -267,13 +331,18 @@ class TwoMediaNeRFModel(Model):
         ray_samples_air_coarse = self.sampler_uniform(
             air_bundle, num_samples=self.config.num_coarse_samples
         )
-        weights_air_coarse, _ = self._render_segment(
+        self._apply_temporal_distortion(ray_samples_air_coarse)
+        weights_air_coarse, rgb_air_coarse = self._render_segment(
             self.air_field_coarse, ray_samples_air_coarse
         )
 
-        # Water segment (only for rays that hit water)
+        # Coarse sampling (water)
+        water_bundle: Optional[RayBundle] = None
+        ray_samples_water_coarse: Optional[RaySamples] = None
+        weights_water_coarse = torch.zeros((num_rays, 0, 1), device=device)
+        rgb_water_coarse = torch.zeros((num_rays, 0, 3), device=device)
+
         if hits_water.any():
-            # Create refracted bundle
             entry_points = origins + directions * t_water.unsqueeze(-1)
             refracted_dirs = self._compute_refraction(directions)
             water_origins = entry_points + refracted_dirs * eps
@@ -293,89 +362,108 @@ class TwoMediaNeRFModel(Model):
             ray_samples_water_coarse = self.sampler_uniform(
                 water_bundle, num_samples=self.config.num_coarse_samples
             )
-            weights_water_coarse, _ = self._render_segment(
+            self._apply_temporal_distortion(ray_samples_water_coarse)
+            weights_water_coarse, rgb_water_coarse = self._render_segment(
                 self.water_field_coarse, ray_samples_water_coarse
             )
 
-            # Account for air transmittance
             air_transmittance = 1.0 - weights_air_coarse.sum(dim=-2, keepdim=True)
             weights_water_coarse = weights_water_coarse * air_transmittance
-        else:
-            weights_water_coarse = torch.zeros((num_rays, 0, 1), device=device)
-            ray_samples_water_coarse = None
 
-        # ===== FINE PASS =====
-        # Importance sampling in air
+        # Fine sampling (air)
         ray_samples_air_fine = self.sampler_pdf(
             air_bundle, ray_samples_air_coarse, weights_air_coarse.detach()
         )
+        self._apply_temporal_distortion(ray_samples_air_fine)
         weights_air_fine, rgb_air_fine = self._render_segment(
             self.air_field_fine, ray_samples_air_fine
         )
 
-        # Importance sampling in water
-        if hits_water.any():
+        # Fine sampling (water)
+        weights_water_fine = torch.zeros((num_rays, 0, 1), device=device)
+        rgb_water_fine = torch.zeros((num_rays, 0, 3), device=device)
+        ray_samples_water_fine: Optional[RaySamples] = None
+
+        if hits_water.any() and water_bundle is not None and ray_samples_water_coarse is not None:
             ray_samples_water_fine = self.sampler_pdf(
                 water_bundle, ray_samples_water_coarse, weights_water_coarse.detach()
             )
-
+            self._apply_temporal_distortion(ray_samples_water_fine)
             weights_water_fine, rgb_water_fine = self._render_segment(
                 self.water_field_fine, ray_samples_water_fine
             )
 
-            # Account for air transmittance
             air_transmittance_fine = 1.0 - weights_air_fine.sum(dim=-2, keepdim=True)
             weights_water_fine = weights_water_fine * air_transmittance_fine
-        else:
-            weights_water_fine = torch.zeros((num_rays, 0, 1), device=device)
-            rgb_water_fine = torch.zeros((num_rays, 0, 3), device=device)
-            ray_samples_water_fine = None
 
-        # ===== FINAL RENDERING =====
-        weights = torch.cat([weights_air_fine, weights_water_fine], dim=-2)
-        rgbs = torch.cat([rgb_air_fine, rgb_water_fine], dim=-2)
+        # Aggregate coarse outputs
+        weights_coarse_all = torch.cat([weights_air_coarse, weights_water_coarse], dim=-2)
+        rgbs_coarse = torch.cat([rgb_air_coarse, rgb_water_coarse], dim=-2)
+        rgb_coarse = self.renderer_rgb(rgb=rgbs_coarse, weights=weights_coarse_all)
+        accumulation_coarse = self.renderer_accumulation(weights_coarse_all)
+        depth_coarse = self._expected_depth(
+            weights_coarse_all,
+            accumulation_coarse,
+            ray_samples_air_coarse,
+            ray_samples_water_coarse,
+            t_water,
+        )
 
-        rgb = self.renderer_rgb(rgb=rgbs, weights=weights)
-        accumulation = self.renderer_accumulation(weights)
-
-        # Depth
-        t_mids_air = (ray_samples_air_fine.frustums.starts + ray_samples_air_fine.frustums.ends) / 2.0
-        if hits_water.any() and ray_samples_water_fine is not None:
-            t_mids_water = (
-                (ray_samples_water_fine.frustums.starts + ray_samples_water_fine.frustums.ends) / 2.0
-                + t_water.view(num_rays, 1, 1)
-            )
-        else:
-            t_mids_water = torch.zeros((num_rays, 0, 1), device=device)
-
-        t_mids_all = torch.cat([t_mids_air, t_mids_water], dim=-2)
-        depth = (weights * t_mids_all).sum(dim=-2) / (accumulation + 1e-10)
+        # Aggregate fine outputs
+        weights_fine_all = torch.cat([weights_air_fine, weights_water_fine], dim=-2)
+        rgbs_fine = torch.cat([rgb_air_fine, rgb_water_fine], dim=-2)
+        rgb_fine = self.renderer_rgb(rgb=rgbs_fine, weights=weights_fine_all)
+        accumulation_fine = self.renderer_accumulation(weights_fine_all)
+        depth_fine = self._expected_depth(
+            weights_fine_all,
+            accumulation_fine,
+            ray_samples_air_fine,
+            ray_samples_water_fine,
+            t_water,
+        )
 
         return {
-            "rgb": rgb,
-            "accumulation": accumulation,
-            "depth": depth,
+            "rgb_coarse": rgb_coarse,
+            "rgb_fine": rgb_fine,
+            "accumulation_coarse": accumulation_coarse,
+            "accumulation_fine": accumulation_fine,
+            "depth_coarse": depth_coarse,
+            "depth_fine": depth_fine,
+            "rgb": rgb_fine,
+            "accumulation": accumulation_fine,
+            "depth": depth_fine,
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
         if self.air_field_coarse is None or self.air_field_fine is None or self.water_field_coarse is None or self.water_field_fine is None:
             raise ValueError("populate_modules() must be called before get_param_groups")
-        # Keep separate optimizers for air and water branches to match TrainerConfig
         param_groups["air_field"] = list(self.air_field_coarse.parameters()) + list(self.air_field_fine.parameters())
         param_groups["water_field"] = list(self.water_field_coarse.parameters()) + list(self.water_field_fine.parameters())
+        if self.temporal_distortion is not None:
+            param_groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
         return param_groups
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, Tensor]:
-        device = outputs["rgb"].device
+        device = outputs["rgb_coarse"].device
         image = batch["image"].to(device)
-        pred_rgb, gt_rgb = self.renderer_rgb.blend_background_for_loss_computation(
-            pred_image=outputs["rgb"],
-            pred_accumulation=outputs["accumulation"],
+        coarse_pred, coarse_image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb_coarse"],
+            pred_accumulation=outputs["accumulation_coarse"],
             gt_image=image,
         )
-        rgb_loss = self.rgb_loss(gt_rgb, pred_rgb)
-        return {"rgb_loss": rgb_loss}
+        fine_pred, fine_image = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb_fine"],
+            pred_accumulation=outputs["accumulation_fine"],
+            gt_image=image,
+        )
+
+        rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
+        rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
+
+        loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
+        loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
+        return loss_dict
 
     def get_metrics_dict(self, outputs, batch):
         return {}
@@ -383,23 +471,47 @@ class TwoMediaNeRFModel(Model):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, Tensor], batch: Dict[str, Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, Tensor]]:
-        image = batch["image"].to(outputs["rgb"].device)
+        image = batch["image"].to(outputs["rgb_coarse"].device)
         image = self.renderer_rgb.blend_background(image)
-        rgb = outputs["rgb"]
-        acc = colormaps.apply_colormap(outputs["accumulation"])
-        depth = colormaps.apply_depth_colormap(outputs["depth"], accumulation=outputs["accumulation"])
+        rgb_coarse = outputs["rgb_coarse"]
+        rgb_fine = outputs["rgb_fine"]
+        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
+        acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
+        assert self.config.collider_params is not None
+        depth_coarse = colormaps.apply_depth_colormap(
+            outputs["depth_coarse"],
+            accumulation=outputs["accumulation_coarse"],
+            near_plane=self.config.collider_params["near_plane"],
+            far_plane=self.config.collider_params["far_plane"],
+        )
+        depth_fine = colormaps.apply_depth_colormap(
+            outputs["depth_fine"],
+            accumulation=outputs["accumulation_fine"],
+            near_plane=self.config.collider_params["near_plane"],
+            far_plane=self.config.collider_params["far_plane"],
+        )
 
-        combined_rgb = torch.cat([image, rgb], dim=1)
+        combined_rgb = torch.cat([image, rgb_coarse, rgb_fine], dim=1)
+        combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
+        combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
 
-        # Metrics
+        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
         image_t = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb_t = torch.moveaxis(rgb, -1, 0)[None, ...]
+        rgb_coarse_t = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
+        rgb_fine_t = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
 
-        psnr = self.psnr(image_t, rgb_t)
-        ssim = self.ssim(image_t, rgb_t)
-        lpips = self.lpips(image_t, rgb_t)
+        coarse_psnr = self.psnr(image_t, rgb_coarse_t)
+        fine_psnr = self.psnr(image_t, rgb_fine_t)
+        fine_ssim = self.ssim(image_t, rgb_fine_t)
+        fine_lpips = self.lpips(image_t, rgb_fine_t)
+        assert isinstance(fine_ssim, torch.Tensor)
 
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim), "lpips": float(lpips)}
-        images_dict = {"img": combined_rgb, "accumulation": acc, "depth": depth}
-
+        metrics_dict = {
+            "psnr": float(fine_psnr.item()),
+            "coarse_psnr": float(coarse_psnr),
+            "fine_psnr": float(fine_psnr),
+            "fine_ssim": float(fine_ssim),
+            "fine_lpips": float(fine_lpips),
+        }
+        images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict
