@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
+import math
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -52,6 +53,8 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     # Interface parameters
     water_surface_height_world: float = 0.0
     """Height of water surface in world coordinates (before dataparser transform)."""
+    water_surface_height_model: Optional[float] = None
+    """If set, use this height directly in model coordinates (after dataparser transform), ignoring water_surface_height_world."""
     air_refractive_index: float = 1.0
     """Refractive index of air."""
     water_refractive_index: float = 1.333
@@ -157,6 +160,19 @@ class TwoMediaNeRFModel(Model):
 
     def _setup_water_interface(self) -> None:
         """Compute water surface plane in model coordinates."""
+
+        # Option 1: Use water_surface_height_model directly (no transformation)
+        if self.config.water_surface_height_model is not None:
+            # Horizontal plane at specified height in model coordinates
+            self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=False)
+            water_z = -self.config.water_surface_height_model
+            offset = torch.tensor([water_z])
+            self.register_buffer("water_plane_offset", offset, persistent=False)
+            self.register_buffer("water_plane_d", offset, persistent=False)
+            CONSOLE.log(f"[cyan]Water surface at z={self.config.water_surface_height_model:.4f} (model coords, no transform)[/cyan]")
+            return
+
+        # Option 2: Transform from world coordinates
         # Get dataparser transform
         transform = self.kwargs.get("dataparser_transform")
         scale = float(self.kwargs.get("dataparser_scale", 1.0))
@@ -196,13 +212,22 @@ class TwoMediaNeRFModel(Model):
         self.register_buffer("water_plane_offset", offset, persistent=False)
         self.register_buffer("water_plane_d", offset, persistent=False)
 
-        # Log resulting position
+        # Log resulting position and warn if not horizontal
         if abs(normal_model[2]) > 1e-6:
             # Solve for z when x=0, y=0: n_z * z + d = 0 → z = -d/n_z
             water_z_model = -d / normal_model[2]
-            CONSOLE.log(f"Water surface at z={water_z_model.item():.4f} in model space")
+            cosine = abs(normal_model[2]).clamp(-1.0, 1.0)
+            angle_rad = torch.acos(cosine).item()
+            angle_deg = math.degrees(angle_rad)
+            if angle_deg > 5:
+                CONSOLE.log(f"[yellow]Water surface transformed to z={water_z_model.item():.4f}, "
+                           f"normal={normal_model.tolist()}, angle from horizontal={angle_deg:.1f}°[/yellow]")
+                CONSOLE.log(f"[yellow]Consider using water_surface_height_model instead for horizontal plane[/yellow]")
+            else:
+                CONSOLE.log(f"Water surface at z={water_z_model.item():.4f} in model space")
         else:
-            CONSOLE.log("[yellow]Water surface not aligned with z-axis after transform[/yellow]")
+            CONSOLE.log("[red]ERROR: Water surface is VERTICAL after transform! normal={normal_model.tolist()}[/red]")
+            CONSOLE.log("[red]Use water_surface_height_model parameter instead![/red]")
 
     def _signed_distance_to_water(self, positions: Tensor) -> Tensor:
         """Compute signed distance to water surface. Positive = above water (air)."""

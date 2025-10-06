@@ -294,6 +294,11 @@ def copy_images_list(
             pass
         copied_image_paths.append(copied_image_path)
 
+    num_frames = len(copied_image_paths)
+    if num_frames == 0:
+        CONSOLE.log("[bold red]:skull: No usable images in the data folder.")
+        return copied_image_paths
+
     nn_flag = "" if not nearest_neighbor else ":flags=neighbor"
     downscale_chains = [f"[t{i}]scale=iw/{2**i}:ih/{2**i}{nn_flag}[out{i}]" for i in range(num_downscales + 1)]
     downscale_dirs = [Path(str(image_dir) + (f"_{2**i}" if i > 0 else "")) for i in range(num_downscales + 1)]
@@ -308,13 +313,13 @@ def copy_images_list(
         + ";".join(downscale_chains)
     )
 
-    num_frames = len(image_paths)
+    suffix = copied_image_paths[0].suffix
     # ffmpeg batch commands assume all images are the same dimensions.
     # When this is not the case (e.g. mixed portrait and landscape images), we need to do individually.
     # (Unfortunately, that is much slower.)
     for framenum in range(1, (1 if same_dimensions else num_frames) + 1):
         framename = f"{image_prefix}%05d" if same_dimensions else f"{image_prefix}{framenum:05d}"
-        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{image_dir / f"{framename}{copied_image_paths[0].suffix}"}" '
+        ffmpeg_cmd = f'ffmpeg -y -noautorotate -i "{image_dir / f"{framename}{suffix}"}" '
 
         crop_cmd = ""
         if crop_border_pixels is not None:
@@ -332,7 +337,7 @@ def copy_images_list(
 
         downscale_cmd = f' -filter_complex "{select_cmd}{crop_cmd}{downscale_chain}"' + "".join(
             [
-                f' -map "[out{i}]" -q:v 2 "{downscale_dirs[i] / f"{framename}{copied_image_paths[0].suffix}"}"'
+                f' -map "[out{i}]" -q:v 2 "{downscale_dirs[i] / f"{framename}{suffix}"}"'
                 for i in range(num_downscales + 1)
             ]
         )
@@ -342,10 +347,7 @@ def copy_images_list(
             CONSOLE.log(f"... {ffmpeg_cmd}")
         run_command(ffmpeg_cmd, verbose=verbose)
 
-    if num_frames == 0:
-        CONSOLE.log("[bold red]:skull: No usable images in the data folder.")
-    else:
-        CONSOLE.log(f"[bold green]:tada: Done copying images with prefix '{image_prefix}'.")
+    CONSOLE.log(f"[bold green]:tada: Done copying images with prefix '{image_prefix}'.")
 
     return copied_image_paths
 
