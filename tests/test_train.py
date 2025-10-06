@@ -12,7 +12,7 @@ from nerfstudio.configs.method_configs import method_configs
 from nerfstudio.data.dataparsers.blender_dataparser import BlenderDataParserConfig
 from nerfstudio.data.dataparsers.minimal_dataparser import MinimalDataParserConfig
 from nerfstudio.engine.trainer import TrainerConfig
-from nerfstudio.models.vanilla_nerf import VanillaModelConfig
+from nerfstudio.models.vanilla_nerf_nerfacc import VanillaModelConfig
 from nerfstudio.scripts.train import train_loop
 
 BLACKLIST = [

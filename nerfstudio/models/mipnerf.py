@@ -31,7 +31,7 @@ from nerfstudio.model_components.losses import MSELoss, scale_gradients_by_dista
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, RGBRenderer
 from nerfstudio.models.base_model import Model
-from nerfstudio.models.vanilla_nerf import VanillaModelConfig
+from nerfstudio.models.vanilla_nerf_nerfacc import VanillaModelConfig
 from nerfstudio.utils import colormaps, misc
 
 

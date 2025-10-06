@@ -60,7 +60,8 @@ from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
 from nerfstudio.models.two_media_vanilla_nerf import TwoMediaNeRFModel, TwoMediaVanillaModelConfig
-from nerfstudio.models.vanilla_nerf import NeRFModel, VanillaModelConfig
+from nerfstudio.models.vanilla_nerf import NeRFClassicModel, VanillaNeRFClassicModelConfig
+from nerfstudio.models.vanilla_nerf_nerfacc import NeRFModel, VanillaModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.pipelines.dynamic_batch import DynamicBatchPipelineConfig
 from nerfstudio.plugins.registry import discover_methods
@@ -74,7 +75,8 @@ descriptions = {
     "instant-ngp-bounded": "Implementation of Instant-NGP. Recommended for bounded real and synthetic scenes",
     "mipnerf": "High quality model for bounded scenes. (slow)",
     "semantic-nerfw": "Predicts semantic segmentations and filters out transient objects.",
-    "vanilla-nerf": "Original NeRF model. (slow)",
+    "vanilla-nerf": "Original NeRF model with nerfacc acceleration. (slow)",
+    "vanilla-nerf-classic": "Classic NeRF with stratified sampling and separate coarse/fine networks. (very slow)",
     "two-media-vanilla-nerf": "Vanilla NeRF variant with refractive air/water interface.",
     "tensorf": "tensorf",
     "dnerf": "Dynamic-NeRF model. (slow)",
@@ -357,6 +359,26 @@ method_configs["vanilla-nerf"] = TrainerConfig(
             dataparser=BlenderDataParserConfig(),
         ),
         model=VanillaModelConfig(_target=NeRFModel),
+    ),
+    optimizers={
+        "fields": {
+            "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
+            "scheduler": None,
+        },
+        "temporal_distortion": {
+            "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
+            "scheduler": None,
+        },
+    },
+)
+
+method_configs["vanilla-nerf-classic"] = TrainerConfig(
+    method_name="vanilla-nerf-classic",
+    pipeline=VanillaPipelineConfig(
+        datamanager=VanillaDataManagerConfig(
+            dataparser=BlenderDataParserConfig(),
+        ),
+        model=VanillaNeRFClassicModelConfig(_target=NeRFClassicModel),
     ),
     optimizers={
         "fields": {
