@@ -570,6 +570,10 @@ class TwoMediaNeRFModel(Model):
         rgb_air = field_air[FieldHeadNames.RGB]
         depth_mid_air = ((ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0)[..., 0]
 
+        # Track sample counts before cleanup
+        air_sample_count = int(weights_air.shape[0])
+        water_sample_count = sum(int(w.shape[0]) for w in water_weights_chunks) if water_weights_chunks else 0
+
         weights_segments: List[Tensor] = [weights_air]
         rgb_segments: List[Tensor] = [rgb_air]
         ray_index_segments: List[Tensor] = [ray_indices_air]
@@ -582,20 +586,70 @@ class TwoMediaNeRFModel(Model):
             ray_index_segments.extend(water_indices_chunks)
             depth_segments.extend(water_depth_chunks)
 
-        weights_all = torch.cat(weights_segments, dim=0)
-        rgb_all = torch.cat(rgb_segments, dim=0)
-        ray_indices_all = torch.cat(ray_index_segments, dim=0)
-        depth_all = torch.cat(depth_segments, dim=0)
+        # Optimize memory usage: process concatenation in smaller chunks if needed
+        total_samples = sum(w.shape[0] for w in weights_segments)
 
-        if weights_all.numel() > 0 and ray_indices_all.numel() > 0:
-            sort_perm = torch.argsort(ray_indices_all)
-            weights_all = weights_all[sort_perm]
-            rgb_all = rgb_all[sort_perm]
-            ray_indices_all = ray_indices_all[sort_perm]
-            depth_all = depth_all[sort_perm]
+        # Hard limit to prevent OOM errors during evaluation
+        max_samples = 10_000_000
+        if total_samples > max_samples:
+            CONSOLE.log(f"[red]Error: {total_samples:,} samples exceeds limit of {max_samples:,}. "
+                       f"Reduce eval-num-rays-per-chunk (current: {num_rays} rays) or increase grid_levels.[/red]")
+            # Subsample to fit within memory limits
+            subsample_ratio = max_samples / total_samples
+            CONSOLE.log(f"[yellow]Subsampling to {subsample_ratio:.2%} of samples to avoid OOM.[/yellow]")
 
-        self._air_sample_count = int(weights_air.shape[0])
-        self._water_sample_count = sum(int(w.shape[0]) for w in water_weights_chunks)
+            new_weights = []
+            new_rgb = []
+            new_indices = []
+            new_depth = []
+            for w, r, i, d in zip(weights_segments, rgb_segments, ray_index_segments, depth_segments):
+                n = int(w.shape[0] * subsample_ratio)
+                if n > 0:
+                    indices = torch.randperm(w.shape[0], device=w.device)[:n]
+                    new_weights.append(w[indices])
+                    new_rgb.append(r[indices])
+                    new_indices.append(i[indices])
+                    new_depth.append(d[indices])
+            weights_segments = new_weights
+            rgb_segments = new_rgb
+            ray_index_segments = new_indices
+            depth_segments = new_depth
+            total_samples = sum(w.shape[0] for w in weights_segments)
+        elif total_samples > 5_000_000:
+            CONSOLE.log(f"[yellow]Warning: Processing {total_samples:,} samples ({num_rays} rays, {total_samples/num_rays:.1f} samples/ray). Consider reducing eval-num-rays-per-chunk.[/yellow]")
+
+        # Free intermediate chunks to reduce memory pressure
+        if total_samples > 0:
+            weights_all = torch.cat(weights_segments, dim=0)
+            del weights_segments
+
+            rgb_all = torch.cat(rgb_segments, dim=0)
+            del rgb_segments
+
+            ray_indices_all = torch.cat(ray_index_segments, dim=0)
+            del ray_index_segments
+
+            depth_all = torch.cat(depth_segments, dim=0)
+            del depth_segments
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if weights_all.numel() > 0 and ray_indices_all.numel() > 0:
+                sort_perm = torch.argsort(ray_indices_all)
+                weights_all = weights_all[sort_perm]
+                rgb_all = rgb_all[sort_perm]
+                ray_indices_all = ray_indices_all[sort_perm]
+                depth_all = depth_all[sort_perm]
+                del sort_perm
+        else:
+            weights_all = torch.zeros((0, 1), device=device, dtype=dtype)
+            rgb_all = torch.zeros((0, 3), device=device, dtype=dtype)
+            ray_indices_all = torch.zeros((0,), device=device, dtype=torch.long)
+            depth_all = torch.zeros((0,), device=device, dtype=dtype)
+
+        self._air_sample_count = air_sample_count
+        self._water_sample_count = water_sample_count
 
         packed_info_all = nerfacc.pack_info(ray_indices_all, num_rays)
         try:
