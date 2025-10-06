@@ -197,64 +197,26 @@ class TwoMediaNeRFModel(Model):
 
         return F.normalize(refracted, dim=-1)
 
-    def _create_ray_samples(
-        self,
-        ray_bundle: RayBundle,
-        t_starts: Tensor,
-        t_ends: Tensor,
-    ) -> RaySamples:
-        """Create RaySamples from t values along rays."""
-        origins = ray_bundle.origins  # (num_rays, 3)
-        directions = ray_bundle.directions  # (num_rays, 3)
-
-        # Create frustums
-        from nerfstudio.cameras.rays import Frustums
-        frustums = Frustums(
-            origins=origins.unsqueeze(-2).expand(*t_starts.shape, 3),
-            directions=directions.unsqueeze(-2).expand(*t_starts.shape, 3),
-            starts=t_starts.unsqueeze(-1),
-            ends=t_ends.unsqueeze(-1),
-            pixel_area=ray_bundle.pixel_area.unsqueeze(-2).expand(*t_starts.shape, 1) if ray_bundle.pixel_area is not None else None,
-        )
-
-        return RaySamples(
-            frustums=frustums,
-            camera_indices=ray_bundle.camera_indices.unsqueeze(-2).expand(*t_starts.shape, 1) if ray_bundle.camera_indices is not None else None,
-        )
-
     def _render_segment(
         self,
         field: NeRFField,
-        ray_bundle: RayBundle,
-        t_starts: Tensor,
-        t_ends: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        ray_samples: RaySamples,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Render a ray segment through a field.
 
         Returns:
-            weights: (num_rays, num_samples) rendering weights
+            weights: (num_rays, num_samples, 1) rendering weights
             rgb: (num_rays, num_samples, 3) RGB colors
-            densities: (num_rays, num_samples) density values
         """
-        ray_samples = self._create_ray_samples(ray_bundle, t_starts, t_ends)
         field_outputs = field(ray_samples)
 
-        densities = field_outputs[FieldHeadNames.DENSITY].squeeze(-1)  # (num_rays, num_samples)
+        densities = field_outputs[FieldHeadNames.DENSITY]  # (num_rays, num_samples, 1)
         rgb = field_outputs[FieldHeadNames.RGB]  # (num_rays, num_samples, 3)
 
-        # Volume rendering weights
-        deltas = t_ends - t_starts
-        alphas = 1.0 - torch.exp(-densities * deltas)
+        weights = ray_samples.get_weights(densities)
 
-        num_rays = t_starts.shape[0]
-        transmittance = torch.cumprod(
-            torch.cat([torch.ones((num_rays, 1), device=t_starts.device), 1.0 - alphas + 1e-10], dim=-1),
-            dim=-1,
-        )[:, :-1]
-        weights = alphas * transmittance
-
-        return weights, rgb, densities
+        return weights, rgb
 
     def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Tensor]:
         """Forward pass with hierarchical sampling through two media."""
@@ -305,11 +267,8 @@ class TwoMediaNeRFModel(Model):
         ray_samples_air_coarse = self.sampler_uniform(
             air_bundle, num_samples=self.config.num_coarse_samples
         )
-        t_starts_air = ray_samples_air_coarse.frustums.starts[..., 0]
-        t_ends_air = ray_samples_air_coarse.frustums.ends[..., 0]
-
-        weights_air_coarse, rgb_air_coarse, _ = self._render_segment(
-            self.air_field_coarse, ray_bundle, t_starts_air, t_ends_air
+        weights_air_coarse, _ = self._render_segment(
+            self.air_field_coarse, ray_samples_air_coarse
         )
 
         # Water segment (only for rays that hit water)
@@ -334,79 +293,63 @@ class TwoMediaNeRFModel(Model):
             ray_samples_water_coarse = self.sampler_uniform(
                 water_bundle, num_samples=self.config.num_coarse_samples
             )
-            t_starts_water = ray_samples_water_coarse.frustums.starts[..., 0]
-            t_ends_water = ray_samples_water_coarse.frustums.ends[..., 0]
-            weights_water_coarse, rgb_water_coarse, _ = self._render_segment(
-                self.water_field_coarse, water_bundle, t_starts_water, t_ends_water
+            weights_water_coarse, _ = self._render_segment(
+                self.water_field_coarse, ray_samples_water_coarse
             )
 
             # Account for air transmittance
-            air_transmittance = 1.0 - weights_air_coarse.sum(dim=-1, keepdim=True)
+            air_transmittance = 1.0 - weights_air_coarse.sum(dim=-2, keepdim=True)
             weights_water_coarse = weights_water_coarse * air_transmittance
         else:
-            weights_water_coarse = torch.zeros((num_rays, 0), device=device)
-            rgb_water_coarse = torch.zeros((num_rays, 0, 3), device=device)
-            t_starts_water = torch.zeros((num_rays, 0), device=device)
-            t_ends_water = torch.zeros((num_rays, 0), device=device)
+            weights_water_coarse = torch.zeros((num_rays, 0, 1), device=device)
+            ray_samples_water_coarse = None
 
         # ===== FINE PASS =====
         # Importance sampling in air
-        ray_samples_pdf_air = self.sampler_pdf(ray_bundle, self._create_ray_samples(ray_bundle, t_starts_air, t_ends_air), weights_air_coarse.detach())
-        t_starts_air_fine = ray_samples_pdf_air.frustums.starts[..., 0]
-        t_ends_air_fine = ray_samples_pdf_air.frustums.ends[..., 0]
-
-        # Combine coarse + fine for air
-        t_starts_air_all = torch.cat([t_starts_air, t_starts_air_fine], dim=-1)
-        t_ends_air_all = torch.cat([t_ends_air, t_ends_air_fine], dim=-1)
-        # Sort by start time
-        t_mids_air = (t_starts_air_all + t_ends_air_all) / 2.0
-        sorted_indices_air = torch.argsort(t_mids_air, dim=-1)
-        t_starts_air_all = torch.gather(t_starts_air_all, -1, sorted_indices_air)
-        t_ends_air_all = torch.gather(t_ends_air_all, -1, sorted_indices_air)
-
-        weights_air_fine, rgb_air_fine, _ = self._render_segment(
-            self.air_field_fine, ray_bundle, t_starts_air_all, t_ends_air_all
+        ray_samples_air_fine = self.sampler_pdf(
+            air_bundle, ray_samples_air_coarse, weights_air_coarse.detach()
+        )
+        weights_air_fine, rgb_air_fine = self._render_segment(
+            self.air_field_fine, ray_samples_air_fine
         )
 
         # Importance sampling in water
         if hits_water.any():
-            ray_samples_pdf_water = self.sampler_pdf(water_bundle, self._create_ray_samples(water_bundle, t_starts_water, t_ends_water), weights_water_coarse.detach())
-            t_starts_water_fine = ray_samples_pdf_water.frustums.starts[..., 0]
-            t_ends_water_fine = ray_samples_pdf_water.frustums.ends[..., 0]
+            ray_samples_water_fine = self.sampler_pdf(
+                water_bundle, ray_samples_water_coarse, weights_water_coarse.detach()
+            )
 
-            t_starts_water_all = torch.cat([t_starts_water, t_starts_water_fine], dim=-1)
-            t_ends_water_all = torch.cat([t_ends_water, t_ends_water_fine], dim=-1)
-            t_mids_water = (t_starts_water_all + t_ends_water_all) / 2.0
-            sorted_indices_water = torch.argsort(t_mids_water, dim=-1)
-            t_starts_water_all = torch.gather(t_starts_water_all, -1, sorted_indices_water)
-            t_ends_water_all = torch.gather(t_ends_water_all, -1, sorted_indices_water)
-
-            weights_water_fine, rgb_water_fine, _ = self._render_segment(
-                self.water_field_fine, water_bundle, t_starts_water_all, t_ends_water_all
+            weights_water_fine, rgb_water_fine = self._render_segment(
+                self.water_field_fine, ray_samples_water_fine
             )
 
             # Account for air transmittance
-            air_transmittance_fine = 1.0 - weights_air_fine.sum(dim=-1, keepdim=True)
+            air_transmittance_fine = 1.0 - weights_air_fine.sum(dim=-2, keepdim=True)
             weights_water_fine = weights_water_fine * air_transmittance_fine
         else:
-            weights_water_fine = torch.zeros((num_rays, 0), device=device)
+            weights_water_fine = torch.zeros((num_rays, 0, 1), device=device)
             rgb_water_fine = torch.zeros((num_rays, 0, 3), device=device)
-            t_starts_water_all = torch.zeros((num_rays, 0), device=device)
-            t_ends_water_all = torch.zeros((num_rays, 0), device=device)
+            ray_samples_water_fine = None
 
         # ===== FINAL RENDERING =====
-        weights = torch.cat([weights_air_fine, weights_water_fine], dim=-1)
+        weights = torch.cat([weights_air_fine, weights_water_fine], dim=-2)
         rgbs = torch.cat([rgb_air_fine, rgb_water_fine], dim=-2)
 
-        rgb = (weights.unsqueeze(-1) * rgbs).sum(dim=-2)
-        accumulation = weights.sum(dim=-1, keepdim=True)
+        rgb = (weights * rgbs).sum(dim=-2)
+        accumulation = weights.sum(dim=-2)
 
         # Depth
-        t_mids_all = torch.cat([
-            (t_starts_air_all + t_ends_air_all) / 2.0,
-            (t_starts_water_all + t_ends_water_all) / 2.0 + t_water.unsqueeze(-1) if hits_water.any() else torch.zeros((num_rays, 0), device=device),
-        ], dim=-1)
-        depth = (weights * t_mids_all).sum(dim=-1, keepdim=True) / (accumulation + 1e-10)
+        t_mids_air = (ray_samples_air_fine.frustums.starts + ray_samples_air_fine.frustums.ends) / 2.0
+        if hits_water.any() and ray_samples_water_fine is not None:
+            t_mids_water = (
+                (ray_samples_water_fine.frustums.starts + ray_samples_water_fine.frustums.ends) / 2.0
+                + t_water.view(num_rays, 1, 1)
+            )
+        else:
+            t_mids_water = torch.zeros((num_rays, 0, 1), device=device)
+
+        t_mids_all = torch.cat([t_mids_air, t_mids_water], dim=-2)
+        depth = (weights * t_mids_all).sum(dim=-2) / (accumulation + 1e-10)
 
         # Background
         if self.config.background_color == "white":
