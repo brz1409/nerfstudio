@@ -18,7 +18,6 @@ Evaluation utils
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Callable, Literal, Optional, Tuple
@@ -43,21 +42,39 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
         A tuple of the path to the loaded checkpoint and the step at which it was saved.
     """
     assert config.load_dir is not None
+    load_dir = Path(config.load_dir)
     if config.load_step is None:
         CONSOLE.print("Loading latest checkpoint from load_dir")
         # NOTE: this is specific to the checkpoint name format
-        if not os.path.exists(config.load_dir):
+        if not load_dir.exists():
             CONSOLE.rule("Error", style="red")
-            CONSOLE.print(f"No checkpoint directory found at {config.load_dir}, ", justify="center")
+            CONSOLE.print(f"No checkpoint directory found at {load_dir}, ", justify="center")
             CONSOLE.print(
                 "Please make sure the checkpoint exists, they should be generated periodically during training",
                 justify="center",
             )
             sys.exit(1)
-        load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(config.load_dir))[-1]
+        checkpoint_steps = []
+        for entry in load_dir.iterdir():
+            if not entry.is_file() or entry.suffix != ".ckpt":
+                continue
+            stem = entry.stem
+            if not stem.startswith("step-"):
+                continue
+            step_str = stem[len("step-") :]
+            if not step_str.isdigit():
+                continue
+            checkpoint_steps.append(int(step_str))
+
+        if not checkpoint_steps:
+            CONSOLE.rule("Error", style="red")
+            CONSOLE.print(f"No checkpoints matching 'step-*.ckpt' found in {load_dir}", justify="center")
+            sys.exit(1)
+
+        load_step = max(checkpoint_steps)
     else:
         load_step = config.load_step
-    load_path = config.load_dir / f"step-{load_step:09d}.ckpt"
+    load_path = load_dir / f"step-{load_step:09d}.ckpt"
     assert load_path.exists(), f"Checkpoint {load_path} does not exist"
     loaded_state = torch.load(load_path, map_location="cpu")
     pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])

@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -430,11 +431,31 @@ class Trainer:
         load_dir = self.config.load_dir
         load_checkpoint = self.config.load_checkpoint
         if load_dir is not None:
+            load_dir = Path(load_dir)
             load_step = self.config.load_step
             if load_step is None:
                 print("Loading latest Nerfstudio checkpoint from load_dir...")
                 # NOTE: this is specific to the checkpoint name format
-                load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
+                checkpoint_steps = []
+                for entry in load_dir.iterdir():
+                    if not entry.is_file() or entry.suffix != ".ckpt":
+                        continue
+                    stem = entry.stem
+                    if not stem.startswith("step-"):
+                        continue
+                    step_str = stem[len("step-") :]
+                    if not step_str.isdigit():
+                        continue
+                    checkpoint_steps.append(int(step_str))
+
+                if not checkpoint_steps:
+                    CONSOLE.rule("Error", style="red")
+                    CONSOLE.print(
+                        f"No checkpoints matching 'step-*.ckpt' found in {load_dir}", justify="center"
+                    )
+                    sys.exit(1)
+
+                load_step = max(checkpoint_steps)
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
             loaded_state = torch.load(load_path, map_location="cpu")

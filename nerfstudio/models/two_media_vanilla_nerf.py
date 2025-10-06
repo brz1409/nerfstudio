@@ -165,7 +165,9 @@ class TwoMediaNeRFModel(Model):
             # Identity transform
             self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=False)
             water_z = -self.config.water_surface_height_world
-            self.register_buffer("water_plane_d", torch.tensor([water_z]), persistent=False)
+            offset = torch.tensor([water_z])
+            self.register_buffer("water_plane_offset", offset, persistent=False)
+            self.register_buffer("water_plane_d", offset, persistent=False)
             CONSOLE.log(f"Water surface at z={water_z:.4f} (no transform)")
             return
 
@@ -190,7 +192,9 @@ class TwoMediaNeRFModel(Model):
         d = -torch.dot(normal_model, point_model)
 
         self.register_buffer("water_plane_normal", normal_model.unsqueeze(0), persistent=False)
-        self.register_buffer("water_plane_d", torch.tensor([d]), persistent=False)
+        offset = torch.tensor([d])
+        self.register_buffer("water_plane_offset", offset, persistent=False)
+        self.register_buffer("water_plane_d", offset, persistent=False)
 
         # Log resulting position
         if abs(normal_model[2]) > 1e-6:
