@@ -120,28 +120,60 @@ class TwoMediaNeRFModel(Model):
             direction_encoding=direction_encoding,
         )
 
-        self.scene_aabb = Parameter(self.scene_box.aabb.flatten(), requires_grad=False)
+        # First, set up interface geometry to know water surface location
+        self._setup_interface_geometry()
+
+        # Use full scene box for rendering, but clip it for occupancy grid
+        full_scene_aabb = self.scene_box.aabb.flatten()
+        self.scene_aabb = Parameter(full_scene_aabb, requires_grad=False)
+
+        # Clip occupancy grid to only the region with actual content
+        # If water surface is defined, use only underwater region for occupancy grid
+        occupancy_aabb = full_scene_aabb.clone()
+
+        # Get water surface z-coordinate in model space
+        water_z_model = self._get_water_surface_z_model()
+        if water_z_model is not None:
+            # Check if most of scene is above or below water
+            scene_center_z = (full_scene_aabb[2] + full_scene_aabb[5]) / 2.0
+
+            if scene_center_z < water_z_model:
+                # Scene is mostly underwater - clip occupancy grid to underwater only
+                occupancy_aabb[5] = min(occupancy_aabb[5], water_z_model)  # Clip max z to water surface
+                CONSOLE.log(f"[cyan]Clipping occupancy grid to underwater region (z <= {water_z_model:.4f})[/cyan]")
+            else:
+                # Scene is mostly above water - clip occupancy grid to above-water only
+                occupancy_aabb[2] = max(occupancy_aabb[2], water_z_model)  # Clip min z to water surface
+                CONSOLE.log(f"[cyan]Clipping occupancy grid to above-water region (z >= {water_z_model:.4f})[/cyan]")
+
+        self.occupancy_aabb = Parameter(occupancy_aabb, requires_grad=False)
 
         # Log scene dimensions for debugging
         scene_size = self.scene_aabb[3:] - self.scene_aabb[:3]
         scene_diagonal = torch.sqrt((scene_size ** 2).sum()).item()
-        CONSOLE.log(f"Scene box: min={self.scene_aabb[:3].cpu().numpy()}, max={self.scene_aabb[3:].cpu().numpy()}")
+        CONSOLE.log(f"Full scene box: min={self.scene_aabb[:3].cpu().numpy()}, max={self.scene_aabb[3:].cpu().numpy()}")
         CONSOLE.log(f"Scene size: {scene_size.cpu().numpy()}, diagonal={scene_diagonal:.4f}")
 
+        occ_size = self.occupancy_aabb[3:] - self.occupancy_aabb[:3]
+        occ_diagonal = torch.sqrt((occ_size ** 2).sum()).item()
+        CONSOLE.log(f"Occupancy grid box: min={self.occupancy_aabb[:3].cpu().numpy()}, max={self.occupancy_aabb[3:].cpu().numpy()}")
+        CONSOLE.log(f"Occupancy grid size: {occ_size.cpu().numpy()}, diagonal={occ_diagonal:.4f}")
+
         if self.config.render_step_size is None:
-            # Auto step size: ~1000 samples in the base level grid.
-            auto_step_size = scene_diagonal / 1000
+            # Auto step size based on OCCUPANCY GRID size, not full scene
+            auto_step_size = occ_diagonal / 1000
             self.config.render_step_size = auto_step_size
             CONSOLE.log(f"Auto-computed render_step_size: {auto_step_size:.6f}")
 
             # For very large scenes, use a more conservative step size
             if auto_step_size > 0.1:
                 self.config.render_step_size = 0.01
-                CONSOLE.log(f"[yellow]Scene is very large (diagonal={scene_diagonal:.2f}). "
+                CONSOLE.log(f"[yellow]Scene is very large (diagonal={occ_diagonal:.2f}). "
                            f"Overriding auto step size {auto_step_size:.4f} -> 0.01 to prevent sampling issues.[/yellow]")
 
+        # Use clipped occupancy_aabb instead of full scene_aabb
         self.occupancy_grid = nerfacc.OccGridEstimator(
-            roi_aabb=self.scene_aabb,
+            roi_aabb=self.occupancy_aabb,
             resolution=self.config.grid_resolution,
             levels=self.config.grid_levels,
         )
@@ -206,7 +238,21 @@ class TwoMediaNeRFModel(Model):
 
         self._air_ior = float(self.config.air_refractive_index)
         self._water_ior = float(self.config.water_refractive_index)
-        self._setup_interface_geometry()
+        # Note: _setup_interface_geometry() is now called earlier in populate_modules()
+
+    def _get_water_surface_z_model(self) -> Optional[float]:
+        """Get the water surface z-coordinate in model space."""
+        if not hasattr(self, 'water_plane_normal') or not hasattr(self, 'water_plane_offset'):
+            return None
+
+        normal = self.water_plane_normal[0].cpu()
+        offset = self.water_plane_offset.cpu().item()
+
+        # For a plane n·x + d = 0, solve for z when x=0, y=0
+        # This gives z = -d/n_z (if plane is roughly horizontal)
+        if torch.abs(normal[2]) > 1e-6:
+            return (-offset / normal[2]).item()
+        return None
 
     def _setup_interface_geometry(self) -> None:
         """Compute the interface plane in model coordinates and store as buffers."""
