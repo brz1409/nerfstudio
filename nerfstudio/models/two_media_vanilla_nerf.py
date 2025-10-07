@@ -52,10 +52,22 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: TwoMediaNeRFModel)
 
     # Interface parameters
-    water_surface_height_world: float = 0.0
-    """Height of water surface in world coordinates (before dataparser transform)."""
+    water_surface_height_metashape: Optional[float] = None
+    """Water surface z-coordinate in Agisoft Metashape coordinate system.
+    Use this when working with Metashape data (cameras.xml). The height will be
+    automatically transformed through applied_transform and dataparser_transform.
+    Example: If water is at z=5.0 in Metashape, set this to 5.0."""
+
+    water_surface_height_world: Optional[float] = None
+    """Water surface z-coordinate in Nerfstudio world coordinates (after applied_transform, before dataparser_transform).
+    Use this for data processed with nerfstudio's standard pipeline.
+    Note: For Metashape data, use water_surface_height_metashape instead."""
+
     water_surface_height_model: Optional[float] = None
-    """If set, use this height directly in model coordinates (after dataparser transform), ignoring water_surface_height_world."""
+    """Water surface z-coordinate directly in model coordinates (after all transformations).
+    Use this if you know the exact height in the normalized model space.
+    This bypasses all coordinate transformations."""
+
     air_refractive_index: float = 1.0
     """Refractive index of air."""
     water_refractive_index: float = 1.333
@@ -160,75 +172,227 @@ class TwoMediaNeRFModel(Model):
         )
 
     def _setup_water_interface(self) -> None:
-        """Compute water surface plane in model coordinates."""
+        """Compute water surface plane in model coordinates.
 
-        # Option 1: Use water_surface_height_model directly (no transformation)
+        Supports three coordinate systems (priority: model > world > metashape):
+        1. water_surface_height_model: Direct model coordinates (no transformation)
+        2. water_surface_height_world: Nerfstudio world → model (via dataparser_transform)
+        3. water_surface_height_metashape: Metashape → world → model (via applied_transform + dataparser_transform)
+        """
+
+        # Priority 1: Direct model coordinates (no transformation needed)
         if self.config.water_surface_height_model is not None:
-            # Horizontal plane at specified height in model coordinates
-            self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=False)
-            water_z = -self.config.water_surface_height_model
-            offset = torch.tensor([water_z])
-            self.register_buffer("water_plane_offset", offset, persistent=False)
-            self.register_buffer("water_plane_d", offset, persistent=False)
-            CONSOLE.log(f"[cyan]Water surface at z={self.config.water_surface_height_model:.4f} (model coords, no transform)[/cyan]")
+            self._setup_water_direct_model(self.config.water_surface_height_model)
             return
 
-        # Option 2: Transform from world coordinates
-        # Get dataparser transform
-        transform = self.kwargs.get("dataparser_transform")
-        scale = float(self.kwargs.get("dataparser_scale", 1.0))
-
-        if transform is None:
-            # Identity transform
-            self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=False)
-            water_z = -self.config.water_surface_height_world
-            offset = torch.tensor([water_z])
-            self.register_buffer("water_plane_offset", offset, persistent=False)
-            self.register_buffer("water_plane_d", offset, persistent=False)
-            CONSOLE.log(f"Water surface at z={water_z:.4f} (no transform)")
+        # Priority 2: Nerfstudio world coordinates (apply dataparser_transform)
+        if self.config.water_surface_height_world is not None:
+            self._setup_water_from_nerfstudio_world(self.config.water_surface_height_world)
             return
 
-        # Transform normal and point
-        # World: plane is z = h → normal [0,0,1], point [0,0,h]
-        # Plane equation: n·(x - p) = 0 → n·x - n·p = 0 → n·x + d = 0 where d = -n·p
+        # Priority 3: Metashape coordinates (apply applied_transform + dataparser_transform)
+        if self.config.water_surface_height_metashape is not None:
+            self._setup_water_from_metashape(self.config.water_surface_height_metashape)
+            return
 
+        # No water surface specified - error
+        raise ValueError(
+            "No water surface height specified! You must set ONE of:\n"
+            "  --pipeline.model.water_surface_height_metashape (for Metashape/Agisoft data)\n"
+            "  --pipeline.model.water_surface_height_world (for nerfstudio-processed data)\n"
+            "  --pipeline.model.water_surface_height_model (if you know model-space coordinates)"
+        )
+
+    def _setup_water_direct_model(self, height: float) -> None:
+        """Setup water surface directly in model coordinates (no transformation).
+
+        Args:
+            height: z-coordinate of horizontal water surface in model space
+        """
+        # Horizontal plane: z = height → normal [0,0,1], plane equation: z + d = 0
+        self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=False)
+        d = -height
+        self.register_buffer("water_plane_d", torch.tensor([d]), persistent=False)
+        self.register_buffer("water_plane_offset", torch.tensor([d]), persistent=False)
+
+        CONSOLE.log(f"[cyan]━━━ Water Surface (Direct Model Coords) ━━━[/cyan]")
+        CONSOLE.log(f"  Height (model): z = {height:.4f}")
+        CONSOLE.log(f"  Normal: [0, 0, 1] (horizontal)")
+        CONSOLE.log(f"  Plane equation: z + {d:.4f} = 0")
+
+    def _setup_water_from_nerfstudio_world(self, height: float) -> None:
+        """Transform water surface from Nerfstudio world to model coordinates.
+
+        Args:
+            height: z-coordinate of water surface in Nerfstudio world coordinates
+        """
+        dataparser_transform = self.kwargs.get("dataparser_transform")
+        dataparser_scale = float(self.kwargs.get("dataparser_scale", 1.0))
+
+        if dataparser_transform is None:
+            # No transformation - world = model
+            CONSOLE.log("[yellow]No dataparser_transform found, world = model coordinates[/yellow]")
+            self._setup_water_direct_model(height)
+            return
+
+        # Nerfstudio world: horizontal plane at z = height
         normal_world = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
-        point_world = torch.tensor([0.0, 0.0, self.config.water_surface_height_world], dtype=torch.float32)
+        point_world = torch.tensor([0.0, 0.0, height], dtype=torch.float32)
 
-        # Apply rotation to normal (rotation only, no translation)
-        R = transform[:3, :3].float()
-        t = transform[:3, 3].float()
+        # Transform to model coordinates
+        R = dataparser_transform[:3, :3].float()
+        t = dataparser_transform[:3, 3].float()
 
         normal_model = R @ normal_world
         normal_model = F.normalize(normal_model, dim=0)
 
-        # Transform point: p_model = scale * (R @ p_world + t)
-        point_model = scale * (R @ point_world + t)
+        point_model = dataparser_scale * (R @ point_world + t)
 
         # Plane equation: n·x + d = 0, where d = -n·p
         d = -torch.dot(normal_model, point_model)
 
         self.register_buffer("water_plane_normal", normal_model.unsqueeze(0), persistent=False)
-        offset = torch.tensor([d])
-        self.register_buffer("water_plane_offset", offset, persistent=False)
-        self.register_buffer("water_plane_d", offset, persistent=False)
+        self.register_buffer("water_plane_d", torch.tensor([d]), persistent=False)
+        self.register_buffer("water_plane_offset", torch.tensor([d]), persistent=False)
 
-        # Log resulting position and warn if not horizontal
+        self._log_water_surface_result(
+            "Nerfstudio World",
+            height,
+            normal_model,
+            d,
+            dataparser_scale
+        )
+
+    def _setup_water_from_metashape(self, height: float) -> None:
+        """Transform water surface from Metashape to model coordinates.
+
+        Applies two transformations:
+        1. Metashape → Nerfstudio World (via applied_transform)
+        2. Nerfstudio World → Model (via dataparser_transform + scale)
+
+        Args:
+            height: z-coordinate of water surface in Metashape coordinate system
+        """
+        # Step 1: Get applied_transform
+        applied_transform_data = self.kwargs.get("applied_transform")
+
+        if applied_transform_data is None:
+            # Use standard Metashape convention (from metashape_utils.py:196-198)
+            CONSOLE.log("[yellow]No applied_transform found, using standard Metashape→Nerfstudio convention[/yellow]")
+            applied_transform = torch.eye(4, dtype=torch.float32)
+            applied_transform[:3, :] = applied_transform[:3, :][[2, 0, 1], :]
+        else:
+            applied_transform = torch.tensor(applied_transform_data, dtype=torch.float32)
+            # Handle [3, 4] or [4, 4] format
+            if applied_transform.shape == (3, 4):
+                temp = torch.eye(4, dtype=torch.float32)
+                temp[:3, :] = applied_transform
+                applied_transform = temp
+
+        # Step 2: Metashape coordinates
+        # Horizontal plane: z = height, normal [0, 0, 1]
+        point_metashape = torch.tensor([0.0, 0.0, height], dtype=torch.float32)
+        normal_metashape = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
+
+        # Step 3: Transform to Nerfstudio world
+        # Point: p_world = applied_transform @ [p; 1]
+        point_metashape_homo = torch.cat([point_metashape, torch.ones(1)])
+        point_world = (applied_transform @ point_metashape_homo)[:3]
+
+        # Normal: n_world = applied_transform[:3, :3] @ n_metashape
+        normal_world = applied_transform[:3, :3] @ normal_metashape
+        normal_world = F.normalize(normal_world, dim=0)
+
+        # Step 4: Transform to model
+        dataparser_transform = self.kwargs.get("dataparser_transform")
+        dataparser_scale = float(self.kwargs.get("dataparser_scale", 1.0))
+
+        if dataparser_transform is None:
+            # No further transformation
+            normal_model = normal_world
+            point_model = point_world
+        else:
+            R = dataparser_transform[:3, :3].float()
+            t = dataparser_transform[:3, 3].float()
+
+            normal_model = R @ normal_world
+            normal_model = F.normalize(normal_model, dim=0)
+
+            point_model = dataparser_scale * (R @ point_world + t)
+
+        # Plane equation: n·x + d = 0
+        d = -torch.dot(normal_model, point_model)
+
+        self.register_buffer("water_plane_normal", normal_model.unsqueeze(0), persistent=False)
+        self.register_buffer("water_plane_d", torch.tensor([d]), persistent=False)
+        self.register_buffer("water_plane_offset", torch.tensor([d]), persistent=False)
+
+        # Detailed logging for Metashape
+        CONSOLE.log(f"[cyan]━━━ Water Surface (Metashape → Model) ━━━[/cyan]")
+        CONSOLE.log(f"  Input (Metashape): z = {height:.4f}")
+        CONSOLE.log(f"  After applied_transform (World): {point_world.tolist()}")
+        CONSOLE.log(f"  Normal after applied_transform: {normal_world.tolist()}")
+        self._log_water_surface_result(
+            "Model (final)",
+            None,
+            normal_model,
+            d,
+            dataparser_scale,
+            show_header=False
+        )
+
+    def _log_water_surface_result(
+        self,
+        coord_system: str,
+        input_height: Optional[float],
+        normal_model: torch.Tensor,
+        d: float,
+        scale: float,
+        show_header: bool = True
+    ) -> None:
+        """Log the resulting water surface position and check for issues.
+
+        Args:
+            coord_system: Name of input coordinate system
+            input_height: Input height (if applicable)
+            normal_model: Computed normal in model space
+            d: Plane equation constant
+            scale: Dataparser scale factor
+        """
+        if show_header:
+            CONSOLE.log(f"[cyan]━━━ Water Surface ({coord_system} → Model) ━━━[/cyan]")
+            if input_height is not None:
+                CONSOLE.log(f"  Input ({coord_system}): z = {input_height:.4f}")
+
+        # Check if normal has significant z-component (indicates horizontal-ish plane)
         if abs(normal_model[2]) > 1e-6:
             # Solve for z when x=0, y=0: n_z * z + d = 0 → z = -d/n_z
             water_z_model = -d / normal_model[2]
+
+            # Check angle from horizontal
             cosine = abs(normal_model[2]).clamp(-1.0, 1.0)
             angle_rad = torch.acos(cosine).item()
             angle_deg = math.degrees(angle_rad)
+
+            CONSOLE.log(f"  Output (Model): z ≈ {water_z_model:.4f}")
+            CONSOLE.log(f"  Normal: [{normal_model[0]:.4f}, {normal_model[1]:.4f}, {normal_model[2]:.4f}]")
+            CONSOLE.log(f"  Angle from horizontal: {angle_deg:.2f}°")
+
             if angle_deg > 5:
-                CONSOLE.log(f"[yellow]Water surface transformed to z={water_z_model.item():.4f}, "
-                           f"normal={normal_model.tolist()}, angle from horizontal={angle_deg:.1f}°[/yellow]")
-                CONSOLE.log(f"[yellow]Consider using water_surface_height_model instead for horizontal plane[/yellow]")
+                CONSOLE.log(f"[yellow]  ⚠ WARNING: Water surface is tilted {angle_deg:.1f}° from horizontal![/yellow]")
+                CONSOLE.log(f"[yellow]  This may indicate coordinate system issues.[/yellow]")
+                CONSOLE.log(f"[yellow]  Consider using water_surface_height_model for exact horizontal plane.[/yellow]")
             else:
-                CONSOLE.log(f"Water surface at z={water_z_model.item():.4f} in model space")
+                CONSOLE.log(f"[green]  ✓ Water surface is horizontal (angle < 5°)[/green]")
         else:
-            CONSOLE.log("[red]ERROR: Water surface is VERTICAL after transform! normal={normal_model.tolist()}[/red]")
-            CONSOLE.log("[red]Use water_surface_height_model parameter instead![/red]")
+            # Normal is nearly horizontal → plane is nearly vertical
+            CONSOLE.log(f"[red]  ✗ ERROR: Water surface is VERTICAL in model space![/red]")
+            CONSOLE.log(f"  Normal: {normal_model.tolist()}")
+            CONSOLE.log(f"[red]  This indicates a coordinate system transformation error![/red]")
+            CONSOLE.log(f"[red]  Check your coordinate system parameters and transforms.[/red]")
+
+        CONSOLE.log(f"  Plane equation: {normal_model[0]:.4f}*x + {normal_model[1]:.4f}*y + {normal_model[2]:.4f}*z + {d:.4f} = 0")
+        CONSOLE.log(f"  Dataparser scale: {scale:.4f}")
 
     def _signed_distance_to_water(self, positions: Tensor) -> Tensor:
         """Compute signed distance to water surface. Positive = above water (air)."""
