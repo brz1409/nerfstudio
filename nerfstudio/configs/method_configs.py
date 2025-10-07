@@ -59,6 +59,7 @@ from nerfstudio.models.neus_facto import NeuSFactoModelConfig
 from nerfstudio.models.semantic_nerfw import SemanticNerfWModelConfig
 from nerfstudio.models.splatfacto import SplatfactoModelConfig
 from nerfstudio.models.tensorf import TensoRFModelConfig
+from nerfstudio.models.nerfrac import NeRFracModel, NeRFracModelConfig
 from nerfstudio.models.two_media_vanilla_nerf import TwoMediaNeRFModel, TwoMediaVanillaModelConfig
 from nerfstudio.models.vanilla_nerf import NeRFClassicModel, VanillaNeRFClassicModelConfig
 from nerfstudio.models.vanilla_nerf_nerfacc import NeRFModel, VanillaModelConfig
@@ -78,6 +79,7 @@ descriptions = {
     "vanilla-nerf": "Original NeRF model with nerfacc acceleration. (slow)",
     "vanilla-nerf-classic": "Classic NeRF with stratified sampling and separate coarse/fine networks. (very slow)",
     "two-media-vanilla-nerf": "Vanilla NeRF variant with refractive air/water interface.",
+    "nerfrac": "NeRFrac (ICCV 2023): Neural Radiance Fields through Refractive Surface with learned surface geometry.",
     "tensorf": "tensorf",
     "dnerf": "Dynamic-NeRF model. (slow)",
     "phototourism": "Uses the Phototourism data.",
@@ -414,6 +416,38 @@ method_configs["two-media-vanilla-nerf"] = TrainerConfig(
         "temporal_distortion": {
             "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
             "scheduler": None,
+        },
+    },
+)
+
+method_configs["nerfrac"] = TrainerConfig(
+    method_name="nerfrac",
+    max_num_iterations=200000,
+    pipeline=VanillaPipelineConfig(
+        datamanager=VanillaDataManagerConfig(
+            dataparser=NerfstudioDataParserConfig(),  # Can use LLFF/Nerfstudio format
+            train_num_rays_per_batch=500,
+            eval_num_rays_per_batch=256,
+        ),
+        model=NeRFracModelConfig(
+            _target=NeRFracModel,
+            init_depth=-0.6,
+            refractive_index=1.333,
+            multires_origin=8,
+            multires_refrac_dir=8,
+            num_coarse_samples=64,
+            num_importance_samples=64,
+            raw_noise_std=1.0,
+        ),
+    ),
+    optimizers={
+        "refractive_field": {
+            "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=200000),
+        },
+        "radiance_field": {
+            "optimizer": RAdamOptimizerConfig(lr=5e-4, eps=1e-08),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=200000),
         },
     },
 )
