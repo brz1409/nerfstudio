@@ -41,6 +41,7 @@ from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRen
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
+from nerfstudio.utils.math import intersect_aabb
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -259,6 +260,32 @@ class TwoMediaNeRFModel(Model):
 
         return F.normalize(refracted, dim=-1)
 
+    def _intersect_scene_box(self, origins: Tensor, directions: Tensor) -> Tuple[Tensor, Tensor]:
+        """Compute intersection of rays with scene bounding box.
+
+        This ensures water rays only sample within the valid scene geometry,
+        matching the behavior of vanilla NeRF where Camera automatically clips
+        rays to the scene_box via AABB intersection.
+
+        Args:
+            origins: [N, 3] ray origins
+            directions: [N, 3] ray directions (normalized)
+
+        Returns:
+            t_near: [N] distance to box entry (0 if inside box)
+            t_far: [N] distance to box exit
+        """
+        device = origins.device
+
+        # scene_box.aabb is [2, 3], but intersect_aabb expects [6] (flattened)
+        # Format: [x_min, y_min, z_min, x_max, y_max, z_max]
+        aabb_flat = self.scene_box.aabb.flatten().to(device)
+
+        # Use nerfstudio's standard AABB intersection (same as Camera uses)
+        t_near, t_far = intersect_aabb(origins, directions, aabb_flat)
+
+        return t_near, t_far
+
     def _apply_temporal_distortion(self, ray_samples: Optional[RaySamples]) -> None:
         """Apply temporal distortion offsets in-place if enabled."""
         if self.temporal_distortion is None or ray_samples is None:
@@ -375,7 +402,27 @@ class TwoMediaNeRFModel(Model):
             entry_points = origins + directions * t_water.unsqueeze(-1)
             refracted_dirs = self._compute_refraction(directions)
             water_origins = entry_points + refracted_dirs * eps
-            remaining_dist = torch.clamp(far - t_water, min=0.0)
+
+            # FIX: Use scene_box AABB intersection instead of (far - t_water)
+            # This matches vanilla NeRF behavior where Camera automatically clips rays to scene_box.
+            # Previously: remaining_dist = far - t_water caused 60%+ samples outside scene!
+            t_near_water, t_far_water = self._intersect_scene_box(water_origins, refracted_dirs)
+            remaining_dist = t_far_water
+
+            # Log sampling statistics (once per training session)
+            if self.training and not hasattr(self, '_logged_water_sampling'):
+                valid_mask = remaining_dist > 0
+                if valid_mask.any():
+                    old_method = torch.clamp(far - t_water, min=0.0)
+                    CONSOLE.log(
+                        f"[cyan]Water sampling (scene_box AABB intersection):[/cyan]\n"
+                        f"  Rays hitting water: {valid_mask.sum()}/{num_rays}\n"
+                        f"  Mean sampling distance: {remaining_dist[valid_mask].mean():.4f}\n"
+                        f"  Max sampling distance: {remaining_dist[valid_mask].max():.4f}\n"
+                        f"  Old method (far - t_water) would give: {old_method[valid_mask].mean():.4f} mean\n"
+                        f"  Scene box: {self.scene_box.aabb.tolist()}"
+                    )
+                self._logged_water_sampling = True
 
             water_bundle = RayBundle(
                 origins=water_origins,
