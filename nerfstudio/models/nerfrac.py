@@ -25,14 +25,17 @@ then applies Snell's law to refract rays before sampling the radiance field.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Parameter
 
 from nerfstudio.cameras.rays import RayBundle, RaySamples
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.field_components.encodings import NeRFEncoding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.fields.refractive_field import RefractiveField
@@ -258,22 +261,24 @@ class NeRFracModel(Model):
         Returns:
             normals: Unit normal vectors in NDC space [N_rays, 3]
         """
-        # Enable gradients for surface point computation
-        ray_origins_xy_grad = ray_origins_xy.detach().clone().requires_grad_(True)
-        ray_directions_grad = ray_directions.detach().clone().requires_grad_(True)
+        # Enable gradients even during evaluation (needed for normal computation)
+        with torch.enable_grad():
+            # Enable gradients for surface point computation
+            ray_origins_xy_grad = ray_origins_xy.detach().clone().requires_grad_(True)
+            ray_directions_grad = ray_directions.detach().clone().requires_grad_(True)
 
-        # Query refractive field with gradient tracking
-        dD = self.refractive_field(ray_origins_xy_grad, ray_directions_grad)
+            # Query refractive field with gradient tracking
+            dD = self.refractive_field(ray_origins_xy_grad, ray_directions_grad)
 
-        # Compute gradients of surface depth offset w.r.t. x and y positions
-        grad_outputs = torch.ones_like(dD)
-        grads = torch.autograd.grad(
-            outputs=dD,
-            inputs=ray_origins_xy_grad,
-            grad_outputs=grad_outputs,
-            create_graph=False,
-            retain_graph=False,
-        )[0]  # [N_rays, 2]
+            # Compute gradients of surface depth offset w.r.t. x and y positions
+            grad_outputs = torch.ones_like(dD)
+            grads = torch.autograd.grad(
+                outputs=dD,
+                inputs=ray_origins_xy_grad,
+                grad_outputs=grad_outputs,
+                create_graph=False,
+                retain_graph=False,
+            )[0]  # [N_rays, 2]
 
         # Surface gradient: ∂z/∂x and ∂z/∂y
         dz_dx = grads[:, 0:1]
@@ -646,3 +651,79 @@ class NeRFracModel(Model):
         }
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict
+
+    def export_water_surface(self, output_dir: Path, step: int, grid_resolution: int = 128) -> None:
+        """Export water surface as point cloud (.ply file).
+
+        Args:
+            output_dir: Directory to save surface file
+            step: Current training step (for filename)
+            grid_resolution: Resolution of sampling grid
+        """
+        import struct
+
+        output_dir = Path(output_dir) / "surfaces"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"surface_step_{step:06d}.ply"
+
+        CONSOLE.log(f"[cyan]Exporting water surface to {output_file}[/cyan]")
+
+        # Create grid of ray origins (x, y)
+        x = torch.linspace(-1, 1, grid_resolution, device=self.device)
+        y = torch.linspace(-1, 1, grid_resolution, device=self.device)
+        xx, yy = torch.meshgrid(x, y, indexing="ij")
+        ray_origins_xy = torch.stack([xx.flatten(), yy.flatten()], dim=-1)  # [N, 2]
+
+        # Dummy ray directions (pointing downward in Z)
+        ray_directions = torch.zeros((ray_origins_xy.shape[0], 3), device=self.device)
+        ray_directions[:, 2] = -1.0  # Point down
+
+        # Query refractive field
+        with torch.no_grad():
+            dD = self.refractive_field(ray_origins_xy, ray_directions)  # [N, 1]
+
+        # Compute surface Z
+        # For simplicity: z = init_depth + dD (assuming rays start at z=0)
+        surface_z = self.config.init_depth + dD.squeeze(-1)  # [N]
+
+        # Build point cloud
+        points = torch.stack([ray_origins_xy[:, 0], ray_origins_xy[:, 1], surface_z], dim=-1)  # [N, 3]
+        points_np = points.cpu().numpy()
+
+        # Write PLY file
+        num_points = len(points_np)
+        with open(output_file, "wb") as f:
+            # Header
+            f.write(b"ply\n")
+            f.write(b"format binary_little_endian 1.0\n")
+            f.write(f"element vertex {num_points}\n".encode())
+            f.write(b"property float x\n")
+            f.write(b"property float y\n")
+            f.write(b"property float z\n")
+            f.write(b"end_header\n")
+
+            # Data
+            for point in points_np:
+                f.write(struct.pack("<fff", point[0], point[1], point[2]))
+
+        CONSOLE.log(f"[green]✓ Exported {num_points} surface points to {output_file}[/green]")
+
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        """Get callbacks for training."""
+
+        def export_surface_callback(step: int):
+            """Callback to export water surface every N steps."""
+            assert training_callback_attributes.trainer is not None
+            output_dir = training_callback_attributes.trainer.base_dir
+            self.export_water_surface(output_dir, step, grid_resolution=128)
+
+        callbacks = [
+            TrainingCallback(
+                where_to_run=[TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                func=export_surface_callback,
+                update_every_num_iters=10000,  # Export every 10k steps
+            )
+        ]
+        return callbacks
