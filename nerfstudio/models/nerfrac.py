@@ -53,11 +53,25 @@ class NeRFracModelConfig(ModelConfig):
 
     # Refractive surface parameters
     init_depth: float = -0.6
-    """Initial depth estimate for refractive surface (in NDC coordinates)."""
+    """Initial depth (Z-coordinate) of refractive surface.
+
+    Interpretation depends on use_ndc:
+    - NDC mode (use_ndc=True): Z in NDC coordinates, range [-1, 0]
+      * 0.0 = camera position
+      * -1.0 = infinity
+      * Typical values: -0.3 (near), -0.6 (mid), -0.9 (far)
+
+    - World mode (use_ndc=False): Z in world coordinates (meters/units)
+      * Actual Z-coordinate in your scene's coordinate system
+      * Example: 5.0 for water surface at 5 meters height
+      * Example: 0.0 for ground-level water
+
+    The refractive field learns an offset dD from this initial estimate.
+    """
     refractive_index: float = 1.333
-    """Refractive index of the medium (water: 1.333, glass: ~1.5)."""
+    """Refractive index of the medium below surface (water: 1.333, glass: ~1.5, ice: ~1.31)."""
     air_refractive_index: float = 1.0
-    """Refractive index of air."""
+    """Refractive index of the medium above surface (typically air: 1.0)."""
 
     # Positional encoding for refractive field
     multires_origin: int = 8
@@ -82,8 +96,8 @@ class NeRFracModelConfig(ModelConfig):
     # Optional features
     use_gradient_scaling: bool = False
     """Apply distance-based gradient scaling."""
-    use_ndc: bool = True
-    """Use NDC ray parameterization (for forward-facing scenes like LLFF)."""
+    use_ndc: bool = False
+    """Use NDC ray parameterization (for forward-facing scenes like LLFF). Set to True for LLFF datasets."""
 
     # Camera parameters (needed for NDC transforms)
     image_height: Optional[int] = None
@@ -183,8 +197,10 @@ class NeRFracModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
+        coord_mode = "NDC" if self.config.use_ndc else "World"
         CONSOLE.log(
-            f"NeRFrac initialized: refractive_index={self.config.refractive_index}, "
+            f"NeRFrac initialized: mode={coord_mode}, "
+            f"refractive_index={self.config.refractive_index}, "
             f"init_depth={self.config.init_depth}, "
             f"{self.config.num_coarse_samples} coarse + {self.config.num_importance_samples} fine samples"
         )
@@ -404,15 +420,11 @@ class NeRFracModel(Model):
         return points_camera
 
     def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Tensor]:
-        """Forward pass with refractive surface rendering following NeRFrac paper.
+        """Forward pass with refractive surface rendering.
 
-        Workflow (matching original NeRFrac):
-        1. Query refractive field for surface intersection in NDC
-        2. Compute surface normals (using gradients of refractive field)
-        3. Convert to camera space for physical refraction calculation
-        4. Apply Snell's law in camera space
-        5. Convert refracted rays back to NDC
-        6. Sample and render along refracted rays
+        Two modes supported:
+        - NDC mode (use_ndc=True): Original NeRFrac with NDC↔Camera transforms
+        - World mode (use_ndc=False): Direct world-space refraction
 
         Args:
             ray_bundle: Bundle of rays to render
@@ -424,81 +436,65 @@ class NeRFracModel(Model):
         num_rays = len(ray_bundle)
         device = ray_bundle.origins.device
 
-        # Get camera parameters (needed for NDC transforms)
-        # Try to infer from metadata if not set in config
-        H = self.config.image_height
-        W = self.config.image_width
-        focal = self.config.focal_length
+        origins = ray_bundle.origins  # [num_rays, 3]
+        directions = F.normalize(ray_bundle.directions, dim=-1)  # [num_rays, 3]
 
-        if H is None or W is None or focal is None:
-            # Try to get from camera
-            if hasattr(ray_bundle, 'camera_indices') and ray_bundle.camera_indices is not None:
-                # Use default values if can't infer (will be overridden in real usage)
-                H = H or 392
-                W = W or 392
-                focal = focal or 500.0
-            else:
-                # Fallback defaults
-                H, W, focal = 392, 392, 500.0
+        # Step 1: Query refractive field for surface intersection
+        ray_origins_xy = origins[:, :2]  # [num_rays, 2]
+        dD = self.refractive_field(ray_origins_xy, directions)  # [num_rays, 1]
 
-        origins_ndc = ray_bundle.origins  # [num_rays, 3] - already in NDC if use_ndc=True
-        directions_ndc = F.normalize(ray_bundle.directions, dim=-1)  # [num_rays, 3]
-
-        # Step 1: Query refractive field to estimate surface intersection points
-        # Extract x, y from origins for refractive field query
-        ray_origins_xy = origins_ndc[:, :2]  # [num_rays, 2]
-
-        # Query refractive field for distance offset dD
-        dD = self.refractive_field(ray_origins_xy, directions_ndc)  # [num_rays, 1]
-
-        # Compute surface intersection: Xs = origin + (d + dD) * direction
-        # where d is based on init_depth
-        ox, oy, oz = origins_ndc[:, 0:1], origins_ndc[:, 1:2], origins_ndc[:, 2:3]
-        virz = directions_ndc[:, 2:3]
-
-        # Distance to init surface from ray origin
+        # Compute distance to initial surface
+        oz = origins[:, 2:3]
+        virz = directions[:, 2:3]
         d = (oz - self.config.init_depth) / (-virz + 1e-8)  # [num_rays, 1]
 
-        # Actual surface points in NDC (with learned offset)
-        surface_points_ndc = origins_ndc + (d + dD) * directions_ndc  # [num_rays, 3]
+        # Surface intersection points
+        surface_points = origins + (d + dD) * directions  # [num_rays, 3]
 
-        # Step 2: Compute surface normals using gradient-based method
-        # This elegantly handles curved surfaces without neighbor gathering
-        normals_ndc = self._compute_normals_from_gradients(
-            surface_points_ndc, ray_origins_xy, directions_ndc
+        # Step 2: Compute surface normals
+        normals = self._compute_normals_from_gradients(
+            surface_points, ray_origins_xy, directions
         )  # [num_rays, 3]
 
-        # Step 3: Convert to camera space for refraction calculation
-        # Following original NeRFrac: refraction is computed in camera (real world) space
-        surface_points_cam = self._ndc_to_camera_points(surface_points_ndc, H, W, focal)  # [num_rays, 3]
-        incident_dirs_cam = self._ndc_to_camera_rays(directions_ndc, origins_ndc, H, W, focal)  # [num_rays, 3]
+        # Step 3 & 4: Refraction calculation (mode-dependent)
+        if self.config.use_ndc:
+            # NDC MODE: Original NeRFrac with NDC↔Camera transforms
+            H = self.config.image_height or 392
+            W = self.config.image_width or 392
+            focal = self.config.focal_length or 500.0
 
-        # Transform normals to camera space
-        # Normals in NDC: need to rotate to camera space
-        # For simplicity, use the same normal (assuming near-horizontal surface)
-        normals_cam = normals_ndc  # Approximation for now (TODO: proper transform)
+            # Convert to camera space
+            surface_points_cam = self._ndc_to_camera_points(surface_points, H, W, focal)
+            incident_dirs_cam = self._ndc_to_camera_rays(directions, origins, H, W, focal)
+            normals_cam = normals  # Approximation (TODO: proper transform)
 
-        # Step 4: Apply Snell's law in camera space
-        refracted_dirs_cam = self._compute_refraction(incident_dirs_cam, normals_cam)  # [num_rays, 3]
+            # Apply Snell's law in camera space
+            refracted_dirs_cam = self._compute_refraction(incident_dirs_cam, normals_cam)
 
-        # Step 5: Convert refracted rays back to NDC space
-        refracted_dirs_ndc = self._camera_to_ndc_rays(refracted_dirs_cam, surface_points_ndc, H, W, focal)
-        refracted_dirs_ndc = F.normalize(refracted_dirs_ndc, dim=-1)
+            # Convert back to NDC
+            refracted_dirs = self._camera_to_ndc_rays(refracted_dirs_cam, surface_points, H, W, focal)
+            refracted_dirs = F.normalize(refracted_dirs, dim=-1)
+        else:
+            # WORLD MODE: Direct refraction in world coordinates
+            incident_dirs = F.normalize(directions, dim=-1)
+            refracted_dirs = self._compute_refraction(incident_dirs, normals)
+            refracted_dirs = F.normalize(refracted_dirs, dim=-1)
 
-        # Refracted ray origins: slightly below surface to avoid self-intersection
-        refracted_origins_ndc = surface_points_ndc + refracted_dirs_ndc * 1e-4
+        # Refracted ray origins: slightly below surface
+        eps = 1e-4 if self.config.use_ndc else 1e-3  # Larger epsilon for world coords
+        refracted_origins = surface_points + refracted_dirs * eps
 
         # Compute remaining distance to far plane
         if ray_bundle.fars is not None:
             remaining_dist = ray_bundle.fars[..., 0] - (d + dD).squeeze(-1)
             remaining_dist = torch.clamp(remaining_dist, min=0.0).unsqueeze(-1)
         else:
-            remaining_dist = torch.ones((num_rays, 1), device=device)
+            remaining_dist = torch.ones((num_rays, 1), device=device) * 10.0
 
         # Create refracted ray bundle
         refracted_bundle = RayBundle(
-            origins=refracted_origins_ndc,
-            directions=refracted_dirs_ndc,
+            origins=refracted_origins,
+            directions=refracted_dirs,
             pixel_area=ray_bundle.pixel_area,
             camera_indices=ray_bundle.camera_indices,
             nears=torch.zeros((num_rays, 1), device=device),
@@ -561,9 +557,9 @@ class NeRFracModel(Model):
             "accumulation": accumulation_fine,
             "depth": depth_fine,
             # Additional outputs for debugging/visualization
-            "surface_points": surface_points_ndc,
+            "surface_points": surface_points,
             "surface_depth_offset": dD,
-            "surface_normals": normals_ndc,
+            "surface_normals": normals,
         }
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:

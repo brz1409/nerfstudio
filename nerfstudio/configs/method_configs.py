@@ -431,8 +431,9 @@ method_configs["nerfrac"] = TrainerConfig(
         ),
         model=NeRFracModelConfig(
             _target=NeRFracModel,
-            init_depth=-0.6,
+            init_depth=5.0,  # World coordinates: adjust to your scene's water surface height
             refractive_index=1.333,
+            use_ndc=False,  # World mode by default (set True for LLFF/forward-facing scenes)
             multires_origin=8,
             multires_refrac_dir=8,
             num_coarse_samples=64,
