@@ -327,15 +327,21 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         self,
         markers_ns_world: Dict[str, np.ndarray],
         transforms_json: Dict,
+        cameras_xml: Path,
+        reference_xml: Path,
     ) -> Tuple[Dict[str, np.ndarray], Tuple[np.ndarray, float]]:
-        """Transform water markers from NS World to final training space.
+        """Transform water markers from UTM to final training space.
 
-        This function ensures markers follow the exact same transformation
-        pipeline as camera positions: auto_orient_and_center_poses + scale_factor.
+        IMPORTANT: This function RE-DOES the marker transformation, because the
+        markers from compute_water_markers_ns_world() are in the wrong coordinate system!
+
+        We need to fit the markers directly to transforms.json cameras, not CAMERAS.xml.
 
         Args:
-            markers_ns_world: Markers in NS World coordinates (after applied_transform)
+            markers_ns_world: Markers dict (keys only, we'll reload from reference.xml)
             transforms_json: The transforms.json dict (to get camera poses)
+            cameras_xml: Path to CAMERAS.xml (for UTM references)
+            reference_xml: Path to REFERENCE.xml (for marker UTM coords)
 
         Returns:
             (markers_model, plane_model) where:
@@ -345,35 +351,69 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         import torch
         from nerfstudio.cameras import camera_utils
 
-        # Load camera poses from transforms.json
-        camera_poses = []
+        # Step 1: Load camera UTM references from CAMERAS.xml
+        cameras = [row for row in _parse_cameras_with_refs(cameras_xml) if row.ref_utm is not None]
+        if len(cameras) < 3:
+            raise ValueError("Need at least 3 cameras with UTM references")
+
+        camera_utm = np.stack([row.ref_utm for row in cameras])
+        camera_labels = [row.label for row in cameras]
+
+        # Step 2: Load camera positions from transforms.json (match by label if possible, or use order)
+        camera_poses_dict = {}
         for frame in transforms_json.get("frames", []):
+            file_path = frame.get("file_path", "")
+            # Extract label from file_path (e.g., "images/IMG_001.jpg" -> "IMG_001")
+            label = Path(file_path).stem
             M = np.array(frame["transform_matrix"], dtype=float)
-            # Ensure 4x4
             if M.shape == (3, 4):
                 M = np.vstack([M, [0, 0, 0, 1]])
-            elif M.shape == (4, 4):
-                pass
+            camera_poses_dict[label] = M
+
+        # Match cameras by label or use order
+        camera_poses = []
+        camera_transforms_positions = []
+        for label in camera_labels:
+            if label in camera_poses_dict:
+                camera_poses.append(camera_poses_dict[label])
+                camera_transforms_positions.append(camera_poses_dict[label][:3, 3])
             else:
-                continue
-            camera_poses.append(M)
+                # Fallback: try to match by index (not ideal but better than crashing)
+                idx = len(camera_poses)
+                if idx < len(camera_poses_dict):
+                    all_poses = list(camera_poses_dict.values())
+                    camera_poses.append(all_poses[idx])
+                    camera_transforms_positions.append(all_poses[idx][:3, 3])
 
         if len(camera_poses) == 0:
-            raise ValueError("No camera poses found in transforms.json")
+            raise ValueError("No matching camera poses found in transforms.json")
 
         camera_poses = np.array(camera_poses)
+        camera_transforms_positions = np.array(camera_transforms_positions)
 
-        # DEBUG: Log camera and marker positions BEFORE transformation
-        camera_positions_ns = camera_poses[:, :3, 3]
-        CONSOLE.log("[cyan]═══ Marker Transformation Debug ═══[/cyan]")
-        CONSOLE.log(f"[cyan]Camera positions (NS World):[/cyan]")
-        CONSOLE.log(f"  Range: [{camera_positions_ns.min(axis=0)}, {camera_positions_ns.max(axis=0)}]")
-        CONSOLE.log(f"  Mean: {camera_positions_ns.mean(axis=0)}")
+        # Step 3: Fit Umeyama: UTM → transforms.json positions (NOT CAMERAS.xml local!)
+        s_fit, R_fit, t_fit = umeyama(camera_utm, camera_transforms_positions, with_scale=True)
 
-        marker_positions_ns = np.array([markers_ns_world[k] for k in sorted(markers_ns_world.keys())])
-        CONSOLE.log(f"[cyan]Marker positions (NS World):[/cyan]")
-        CONSOLE.log(f"  Range: [{marker_positions_ns.min(axis=0)}, {marker_positions_ns.max(axis=0)}]")
-        CONSOLE.log(f"  Mean: {marker_positions_ns.mean(axis=0)}")
+        CONSOLE.log("[cyan]═══ Marker Transformation Debug (FIXED) ═══[/cyan]")
+        CONSOLE.log(f"[cyan]Umeyama fit (UTM → transforms.json):[/cyan]")
+        CONSOLE.log(f"  Scale: {s_fit:.6f}")
+        CONSOLE.log(f"  Camera UTM mean: {camera_utm.mean(axis=0)}")
+        CONSOLE.log(f"  Camera transforms.json mean: {camera_transforms_positions.mean(axis=0)}")
+
+        # Step 4: Load markers from reference.xml (UTM coordinates)
+        markers_ref = _parse_markers(reference_xml, None)
+        if len(markers_ref) == 0:
+            raise ValueError("No markers found in reference.xml")
+
+        marker_labels = sorted(markers_ref.keys())
+        markers_utm = np.stack([markers_ref[label] for label in marker_labels])
+
+        # Step 5: Transform markers: UTM → transforms.json coordinate system
+        markers_transforms = apply_similarity(s_fit, R_fit, t_fit, markers_utm)
+
+        CONSOLE.log(f"[cyan]Markers (transforms.json coords, BEFORE auto_orient):[/cyan]")
+        CONSOLE.log(f"  Range: [{markers_transforms.min(axis=0)}, {markers_transforms.max(axis=0)}]")
+        CONSOLE.log(f"  Mean: {markers_transforms.mean(axis=0)}")
 
         # Apply auto_orient_and_center_poses (mimics nerfstudio_dataparser.py:237-241)
         poses_torch = torch.from_numpy(camera_poses.astype(np.float32))
@@ -389,19 +429,22 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             scale_factor /= float(torch.max(torch.abs(oriented_poses[:, :3, 3])))
         scale_factor *= self.config.scale_factor
 
-        # Apply same transformation to markers
+        # Step 6: Apply same transformation to markers (auto_orient + scale)
         transform_matrix_np = transform_matrix.numpy()
         transform_4x4 = _to_homogeneous_4x4(transform_matrix_np)
 
         markers_model = {}
         marker_positions = []
-        labels = sorted(markers_ns_world.keys())
 
-        for label in labels:
-            pos_ns = markers_ns_world[label]
-            # Apply transform_matrix
-            pos_4d = np.append(pos_ns, 1.0)
+        for label in marker_labels:
+            # Get marker position in transforms.json coords (before auto_orient)
+            idx = marker_labels.index(label)
+            pos_transforms = markers_transforms[idx]
+
+            # Apply transform_matrix (auto_orient)
+            pos_4d = np.append(pos_transforms, 1.0)
             pos_oriented = (transform_4x4 @ pos_4d)[:3]
+
             # Apply scale_factor
             pos_model = pos_oriented * scale_factor
             markers_model[label] = pos_model
@@ -469,10 +512,12 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
                 applied_transform_4x4=applied_transform_np,
             )
 
-            # Step 2: Transform to model space
+            # Step 2: Transform to model space (pass XMLs to refit markers directly)
             markers_model, plane_model = self._transform_markers_to_model_space(
-                markers_ns_world=water_result_ns.markers_ns_world,
+                markers_ns_world=water_result_ns.markers_ns_world,  # Only used for keys
                 transforms_json=transforms_json,
+                cameras_xml=cameras_xml,
+                reference_xml=reference_xml,
             )
 
         except Exception as exc:  # pylint: disable=broad-except
