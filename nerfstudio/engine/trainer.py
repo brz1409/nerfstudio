@@ -526,13 +526,6 @@ class Trainer:
         if not splits:
             return
 
-        all_positions = torch.cat([pos for _, pos, _ in splits], dim=0)
-        min_bounds = all_positions.min(dim=0).values
-        max_bounds = all_positions.max(dim=0).values
-        extent = max_bounds - min_bounds
-        max_extent = float(extent.max().item()) if extent.numel() > 0 else 1.0
-        arrow_length = max(max_extent * 0.08, 1e-3)
-
         model = getattr(self.pipeline, "model", None)
         normal = getattr(model, "water_plane_normal", None)
         offset = getattr(model, "water_plane_offset", None)
@@ -558,6 +551,7 @@ class Trainer:
 
             marker_positions_np: Optional[np.ndarray] = None
             marker_labels_plot: Optional[List[str]] = None
+            points_for_bounds: List[np.ndarray] = [pos.detach().cpu().numpy() for _, pos, _ in splits if pos.numel() > 0]
 
             if train_outputs is not None:
                 train_metadata = getattr(train_outputs, "metadata", {})
@@ -570,6 +564,19 @@ class Trainer:
                             [markers_model[label] for label in marker_labels_plot],
                             dtype=float,
                         )
+                        points_for_bounds.append(marker_positions_np)
+
+            if points_for_bounds:
+                concatenated = np.concatenate(points_for_bounds, axis=0)
+                min_bounds = torch.from_numpy(concatenated.min(axis=0))
+                max_bounds = torch.from_numpy(concatenated.max(axis=0))
+            else:
+                min_bounds = torch.zeros(3)
+                max_bounds = torch.ones(3)
+
+            extent = max_bounds - min_bounds
+            max_extent = float(extent.max().item()) if extent.numel() > 0 else 1.0
+            arrow_length = max(max_extent * 0.08, 1e-3)
 
             for idx, (name, positions, directions) in enumerate(splits):
                 color = cmap(idx % cmap.N)
@@ -636,6 +643,7 @@ class Trainer:
                                 + tangent_u[None, None, :] * uu[..., None]
                                 + tangent_v[None, None, :] * vv[..., None]
                             )
+                            points_for_bounds.append(plane_points.reshape(-1, 3))
 
                             ax.plot_surface(
                                 plane_points[..., 0],
@@ -685,6 +693,11 @@ class Trainer:
                 marker_handles.append(
                     Line2D([0], [0], marker="o", color="w", markerfacecolor="red", markersize=6, linestyle="None", label="water markers")
                 )
+
+            if points_for_bounds:
+                concatenated_all = np.concatenate(points_for_bounds, axis=0)
+                min_bounds = torch.from_numpy(concatenated_all.min(axis=0))
+                max_bounds = torch.from_numpy(concatenated_all.max(axis=0))
 
             x_margin = max_extent * 0.1
             ax.set_xlim(float(min_bounds[0] - x_margin), float(max_bounds[0] + x_margin))
