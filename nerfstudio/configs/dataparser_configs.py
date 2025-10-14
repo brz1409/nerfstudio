@@ -30,6 +30,7 @@ from nerfstudio.data.dataparsers.instant_ngp_dataparser import InstantNGPDataPar
 from nerfstudio.data.dataparsers.minimal_dataparser import MinimalDataParserConfig
 from nerfstudio.data.dataparsers.nerfosr_dataparser import NeRFOSRDataParserConfig
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
+from nerfstudio.data.dataparsers.metashape_water_dataparser import MetashapeWaterDataParserConfig
 from nerfstudio.data.dataparsers.nuscenes_dataparser import NuScenesDataParserConfig
 from nerfstudio.data.dataparsers.phototourism_dataparser import PhototourismDataParserConfig
 from nerfstudio.data.dataparsers.scannet_dataparser import ScanNetDataParserConfig
@@ -54,6 +55,7 @@ dataparsers = {
     "sitcoms3d-data": Sitcoms3DDataParserConfig(),
     "scannetpp-data": ScanNetppDataParserConfig(),
     "colmap": ColmapDataParserConfig(),
+    "metashape-water": MetashapeWaterDataParserConfig(),
 }
 
 external_dataparsers, _ = discover_dataparsers()
