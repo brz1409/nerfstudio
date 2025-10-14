@@ -551,7 +551,12 @@ class Trainer:
 
             marker_positions_np: Optional[np.ndarray] = None
             marker_labels_plot: Optional[List[str]] = None
-            points_for_bounds: List[np.ndarray] = [pos.detach().cpu().numpy() for _, pos, _ in splits if pos.numel() > 0]
+
+            # Collect camera positions only (for plane extent calculation)
+            camera_positions_list: List[np.ndarray] = [pos.detach().cpu().numpy() for _, pos, _ in splits if pos.numel() > 0]
+
+            # Collect all points (cameras + markers) for final bounds
+            points_for_bounds: List[np.ndarray] = camera_positions_list.copy()
 
             if train_outputs is not None:
                 train_metadata = getattr(train_outputs, "metadata", {})
@@ -566,6 +571,17 @@ class Trainer:
                         )
                         points_for_bounds.append(marker_positions_np)
 
+            # Calculate extent from cameras only (for plane size)
+            if camera_positions_list:
+                camera_concat = np.concatenate(camera_positions_list, axis=0)
+                camera_min = camera_concat.min(axis=0)
+                camera_max = camera_concat.max(axis=0)
+                camera_extent = camera_max - camera_min
+                camera_max_extent = float(camera_extent.max()) if camera_extent.size > 0 else 1.0
+            else:
+                camera_max_extent = 1.0
+
+            # Calculate bounds from all points (cameras + markers) for axis limits
             if points_for_bounds:
                 concatenated = np.concatenate(points_for_bounds, axis=0)
                 min_bounds = torch.from_numpy(concatenated.min(axis=0))
@@ -635,7 +651,8 @@ class Trainer:
                             tangent_u /= tangent_u_norm
                             tangent_v = np.cross(normal_unit, tangent_u)
 
-                            plane_extent = max(max_extent, 1.0)
+                            # Use camera extent only for plane size (not markers)
+                            plane_extent = max(camera_max_extent * 1.2, 1.0)  # 20% larger than camera extent
                             grid = np.linspace(-plane_extent, plane_extent, 30)
                             uu, vv = np.meshgrid(grid, grid)
                             plane_points = (
@@ -643,7 +660,7 @@ class Trainer:
                                 + tangent_u[None, None, :] * uu[..., None]
                                 + tangent_v[None, None, :] * vv[..., None]
                             )
-                            points_for_bounds.append(plane_points.reshape(-1, 3))
+                            # Don't add plane points to bounds - keep plane constrained to camera extent
 
                             ax.plot_surface(
                                 plane_points[..., 0],
