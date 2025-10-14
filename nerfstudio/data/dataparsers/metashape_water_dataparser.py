@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
@@ -77,6 +78,20 @@ class CameraRow:
     label: str
     matrix: np.ndarray  # 4x4 camera-to-world transform
     ref_utm: Optional[np.ndarray]  # 3-vector world position in UTM coordinates
+    component_id: Optional[str]
+
+
+@dataclass
+class ComponentTransform:
+    """Chunk/component similarity transform defined in cameras.xml."""
+
+    rotation: np.ndarray  # 3x3 orthonormal matrix
+    translation_ecef: np.ndarray  # 3-vector in meters (ECEF)
+    scale: float
+
+    @property
+    def inverse_rotation(self) -> np.ndarray:
+        return self.rotation.T
 
 
 def _parse_cameras_with_refs(cameras_xml: Path) -> List[CameraRow]:
@@ -89,13 +104,69 @@ def _parse_cameras_with_refs(cameras_xml: Path) -> List[CameraRow]:
         matrix = np.fromstring(transform_text, sep=" ").reshape(4, 4)
         ref_utm = None
         reference = cam.find("reference")
+        component_id = cam.get("component_id")
         if reference is not None and all(key in reference.attrib for key in ("x", "y", "z")):
             ref_utm = np.array(
                 [float(reference.get("x")), float(reference.get("y")), float(reference.get("z"))],
                 dtype=float,
             )
-        rows.append(CameraRow(label=cam.get("label", ""), matrix=matrix, ref_utm=ref_utm))
+        rows.append(
+            CameraRow(label=cam.get("label", ""), matrix=matrix, ref_utm=ref_utm, component_id=component_id)
+        )
     return rows
+
+
+def _parse_component_transforms(cameras_xml: Path) -> Dict[str, ComponentTransform]:
+    """Extract chunk/component transforms from cameras.xml."""
+    root = ET.parse(str(cameras_xml)).getroot()
+    component_map: Dict[str, ComponentTransform] = {}
+
+    # components live under chunk/components/component
+    chunk = root.find(".//chunk")
+    if chunk is None:
+        return component_map
+
+    components = chunk.find("components")
+    if components is None:
+        return component_map
+
+    for component in components.iter("component"):
+        component_id = component.get("id")
+        if component_id is None:
+            continue
+
+        rotation_xml = component.find("transform/rotation")
+        translation_xml = component.find("transform/translation")
+        scale_xml = component.find("transform/scale")
+
+        if rotation_xml is None or translation_xml is None or rotation_xml.text is None or translation_xml.text is None:
+            continue
+
+        rotation = np.array([float(x) for x in rotation_xml.text.split()], dtype=float).reshape(3, 3)
+        translation = np.array([float(x) for x in translation_xml.text.split()], dtype=float)
+        scale = float(scale_xml.text) if (scale_xml is not None and scale_xml.text is not None) else 1.0
+
+        component_map[component_id] = ComponentTransform(
+            rotation=rotation,
+            translation_ecef=translation,
+            scale=scale,
+        )
+
+    return component_map
+
+
+def _select_component_transform(cameras: List[CameraRow], component_map: Dict[str, ComponentTransform]) -> ComponentTransform:
+    """Return the unique component transform referenced by the provided cameras."""
+    component_ids = {cam.component_id for cam in cameras if cam.component_id is not None}
+    if not component_ids:
+        return ComponentTransform(rotation=np.eye(3), translation_ecef=np.zeros(3), scale=1.0)
+    if len(component_ids) > 1:
+        raise ValueError("MetashapeWaterDataParser found multiple component_ids across reference cameras.")
+
+    component_id = component_ids.pop()
+    if component_id not in component_map:
+        raise ValueError(f"Component transform '{component_id}' not found in cameras.xml.")
+    return component_map[component_id]
 
 
 def _parse_markers(reference_xml: Path, markers_xml: Optional[Path]) -> Dict[str, np.ndarray]:
@@ -119,6 +190,95 @@ def _parse_markers(reference_xml: Path, markers_xml: Optional[Path]) -> Dict[str
         override_markers = _load(markers_xml, ".//marker")
         base_markers.update(override_markers)
     return base_markers
+
+
+def _utm_to_latlon(easting: float, northing: float, zone: int, northern: bool = True) -> Tuple[float, float]:
+    """Convert UTM coordinates to geodetic latitude/longitude in degrees."""
+    k0 = 0.9996
+    a = 6378137.0
+    e_sq = 6.69437999014e-3
+    e = math.sqrt(e_sq)
+    e_prime_sq = e_sq / (1 - e_sq)
+
+    x = easting - 500000.0
+    y = northing
+    if not northern:
+        y -= 10000000.0
+
+    m = y / k0
+    mu = m / (
+        a
+        * (
+            1
+            - e_sq / 4.0
+            - 3 * e_sq**2 / 64.0
+            - 5 * e_sq**3 / 256.0
+        )
+    )
+
+    e1 = (1 - math.sqrt(1 - e_sq)) / (1 + math.sqrt(1 - e_sq))
+    j1 = (3 * e1 / 2) - (27 * e1**3 / 32)
+    j2 = (21 * e1**2 / 16) - (55 * e1**4 / 32)
+    j3 = 151 * e1**3 / 96
+    j4 = 1097 * e1**4 / 512
+
+    fp = mu + j1 * math.sin(2 * mu) + j2 * math.sin(4 * mu) + j3 * math.sin(6 * mu) + j4 * math.sin(8 * mu)
+
+    sin_fp = math.sin(fp)
+    cos_fp = math.cos(fp)
+    tan_fp = math.tan(fp)
+
+    c1 = e_prime_sq * cos_fp**2
+    t1 = tan_fp**2
+    n1 = a / math.sqrt(1 - e_sq * sin_fp**2)
+    r1 = a * (1 - e_sq) / ((1 - e_sq * sin_fp**2) ** 1.5)
+    d = x / (n1 * k0)
+
+    lat_rad = fp - (n1 * tan_fp / r1) * (
+        d**2 / 2
+        - (5 + 3 * t1 + 10 * c1 - 4 * c1**2 - 9 * e_prime_sq) * d**4 / 24
+        + (61 + 90 * t1 + 298 * c1 + 45 * t1**2 - 252 * e_prime_sq - 3 * c1**2) * d**6 / 720
+    )
+    lon_rad = (
+        d
+        - (1 + 2 * t1 + c1) * d**3 / 6
+        + (5 - 2 * c1 + 28 * t1 - 3 * c1**2 + 8 * e_prime_sq + 24 * t1**2) * d**5 / 120
+    ) / cos_fp
+
+    lon_origin = math.radians((zone - 1) * 6 - 180 + 3)
+
+    lat = math.degrees(lat_rad)
+    lon = math.degrees(lon_origin + lon_rad)
+    return lat, lon
+
+
+def _latlon_to_ecef(lat_deg: float, lon_deg: float, height: float) -> np.ndarray:
+    """Convert latitude/longitude (degrees) and ellipsoidal height to ECEF coordinates."""
+    a = 6378137.0
+    e_sq = 6.69437999014e-3
+
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+
+    sin_lat = math.sin(lat)
+    cos_lat = math.cos(lat)
+    sin_lon = math.sin(lon)
+    cos_lon = math.cos(lon)
+
+    n = a / math.sqrt(1 - e_sq * sin_lat**2)
+
+    x = (n + height) * cos_lat * cos_lon
+    y = (n + height) * cos_lat * sin_lon
+    z = (n * (1 - e_sq) + height) * sin_lat
+
+    return np.array([x, y, z], dtype=float)
+
+
+def _utm_to_ecef(easting: float, northing: float, altitude: float, zone: int) -> Tuple[np.ndarray, float, float]:
+    """Convert UTM coordinates (ETRS89/WGS84 ellipsoid) to ECEF and return intermediate lat/lon."""
+    lat_deg, lon_deg = _utm_to_latlon(easting, northing, zone, northern=True)
+    ecef = _latlon_to_ecef(lat_deg, lon_deg, altitude)
+    return ecef, lat_deg, lon_deg
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +322,10 @@ def apply_similarity(scale: float, rotation: np.ndarray, translation: np.ndarray
 @dataclass
 class WaterMarkersNSWorldResult:
     """Water markers in NS World space (after applied_transform, before auto_orient)."""
+
     markers_ns_world: Dict[str, np.ndarray]
     plane_ns_world: Optional[Tuple[np.ndarray, float]]
-    utm_to_local: Tuple[float, np.ndarray, np.ndarray]  # (scale, rotation, translation)
+    component_transform: ComponentTransform
 
 
 # ---------------------------------------------------------------------------
@@ -175,73 +336,75 @@ def compute_water_markers_ns_world(
     reference_xml: Path,
     markers_xml: Optional[Path],
     applied_transform_4x4: Optional[np.ndarray],
+    utm_zone: int,
 ) -> WaterMarkersNSWorldResult:
     """Project Metashape water markers into NS World space.
 
-    This function handles the transformation from UTM coordinates to NS World:
-    1. UTM → Local (via Umeyama from camera UTM refs to camera local positions)
-    2. Local → NS World (via applied_transform)
-
-    The transformation to final training space is handled separately by the dataparser.
-
+    This function handles the transformation from UTM coordinates to NS World by following the same
+    geodetic pipeline used in `ns-process-data metashape`:
+    1. Convert UTM → latitude/longitude → ECEF.
+    2. Apply the component (chunk) similarity transform from cameras.xml.
+    3. Apply the dataset-level applied_transform recorded in transforms.json.
     Args:
         cameras_xml: Path to Metashape cameras.xml with camera transforms and UTM references
         reference_xml: Path to Metashape reference.xml with marker UTM coordinates
         markers_xml: Optional path to markers.xml that overrides coordinates from reference.xml
         applied_transform_4x4: The 4x4 applied_transform from transforms.json (or default)
+        utm_zone: UTM zone (e.g. 33) used for the coordinate conversion.
 
     Returns:
         WaterMarkersNSWorldResult containing markers and plane in NS World space
 
     Raises:
-        ValueError: If fewer than 3 cameras with references, or no markers found
+        ValueError: If no cameras with references, or no markers found
     """
-    # 1. Load cameras with UTM references
     cameras = [row for row in _parse_cameras_with_refs(cameras_xml) if row.ref_utm is not None]
-    if len(cameras) < 3:
-        raise ValueError("MetashapeWaterDataParser requires at least three cameras with reference coordinates.")
+    if len(cameras) == 0:
+        raise ValueError("MetashapeWaterDataParser requires at least one camera with reference coordinates.")
 
-    # 2. Extract camera positions and fit Umeyama (UTM → Local)
-    utm_positions = np.stack([row.ref_utm for row in cameras])
-    local_centers_c2w = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
-    local_centers_w2c = np.stack([camera_center_from_w2c(row.matrix) for row in cameras])
+    component_map = _parse_component_transforms(cameras_xml)
+    component_transform = _select_component_transform(cameras, component_map)
 
-    s_c2w, R_c2w, t_c2w = umeyama(utm_positions, local_centers_c2w, with_scale=True)
-    s_w2c, R_w2c, t_w2c = umeyama(utm_positions, local_centers_w2c, with_scale=True)
+    applied_transform = np.array(
+        applied_transform_4x4 if applied_transform_4x4 is not None else default_applied_transform(),
+        dtype=float,
+    )
+    if applied_transform.shape == (3, 4):
+        applied_transform = _to_homogeneous_4x4(applied_transform)
 
-    rms_c2w = np.linalg.norm(apply_similarity(s_c2w, R_c2w, t_c2w, utm_positions) - local_centers_c2w, axis=1).mean()
-    rms_w2c = np.linalg.norm(apply_similarity(s_w2c, R_w2c, t_w2c, utm_positions) - local_centers_w2c, axis=1).mean()
-
-    # Choose best fit (c2w vs w2c)
-    similarity = (s_c2w, R_c2w, t_c2w) if rms_c2w <= rms_w2c else (s_w2c, R_w2c, t_w2c)
-
-    # 3. Load markers from reference.xml
     markers_ref = _parse_markers(reference_xml, markers_xml)
     if len(markers_ref) == 0:
         raise ValueError("MetashapeWaterDataParser could not find any water markers in the provided XML files.")
 
     labels = sorted(markers_ref.keys())
-    points_utm = np.stack([markers_ref[label] for label in labels])
+    points_ns = []
+    for label in labels:
+        utm_point = markers_ref[label]
+        ecef_point, _, _ = _utm_to_ecef(utm_point[0], utm_point[1], utm_point[2], zone=utm_zone)
 
-    # 4. Transform UTM → Local
-    points_local = apply_similarity(*similarity, points_utm)
+        # ECEF -> chunk local
+        chunk_local = component_transform.inverse_rotation @ (
+            (ecef_point - component_transform.translation_ecef) / component_transform.scale
+        )
+        # chunk local -> component space (same step used when exporting transforms.json)
+        component_space = component_transform.rotation @ chunk_local + (
+            component_transform.translation_ecef / component_transform.scale
+        )
+        # component space -> NS world (before auto orient/scale)
+        point_ns = apply_4x4(applied_transform, component_space)
+        points_ns.append(point_ns)
 
-    # 5. Transform Local → NS World
-    applied_transform = np.array(applied_transform_4x4 if applied_transform_4x4 is not None else default_applied_transform())
-    points_ns = np.stack([apply_4x4(applied_transform, point) for point in points_local])
-
-    # 6. Compute plane in NS World
+    points_ns = np.array(points_ns)
     plane_ns: Optional[Tuple[np.ndarray, float]] = None
     if len(labels) >= 3:
         plane_ns = plane_from_points(points_ns)
 
-    # 7. Build result
     markers_ns_world = {label: points_ns[idx] for idx, label in enumerate(labels)}
 
     return WaterMarkersNSWorldResult(
         markers_ns_world=markers_ns_world,
         plane_ns_world=plane_ns,
-        utm_to_local=similarity,
+        component_transform=component_transform,
     )
 
 
@@ -275,6 +438,8 @@ class MetashapeWaterDataParserConfig(NerfstudioDataParserConfig):
     """Raise an error when no water plane can be estimated."""
     store_full_marker_metadata: bool = False
     """Save the full marker bundle inside metadata for debugging."""
+    utm_zone: int = 33
+    """UTM zone used for cameras and markers (default: 33 for ETRS89 / UTM 33N)."""
 
 
 class MetashapeWaterDataParser(NerfstudioDataParser):
@@ -332,11 +497,6 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
     ) -> Tuple[Dict[str, np.ndarray], Tuple[np.ndarray, float]]:
         """Transform water markers from UTM to final training space.
 
-        IMPORTANT: This function RE-DOES the marker transformation, because the
-        markers from compute_water_markers_ns_world() are in the wrong coordinate system!
-
-        We need to fit the markers directly to transforms.json cameras, not CAMERAS.xml.
-
         Args:
             markers_ns_world: Markers dict (keys only, we'll reload from reference.xml)
             transforms_json: The transforms.json dict (to get camera poses)
@@ -351,72 +511,58 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         import torch
         from nerfstudio.cameras import camera_utils
 
-        # Step 1: Load camera UTM references from CAMERAS.xml
         cameras = [row for row in _parse_cameras_with_refs(cameras_xml) if row.ref_utm is not None]
-        if len(cameras) < 3:
-            raise ValueError("Need at least 3 cameras with UTM references")
+        if len(cameras) == 0:
+            raise ValueError("Need at least one camera with UTM references")
 
-        camera_utm = np.stack([row.ref_utm for row in cameras])
-        camera_labels = [row.label for row in cameras]
+        component_map = _parse_component_transforms(cameras_xml)
+        component_transform = _select_component_transform(cameras, component_map)
 
-        # Step 2: Load camera positions from transforms.json (match by label if possible, or use order)
-        camera_poses_dict = {}
-        for frame in transforms_json.get("frames", []):
-            file_path = frame.get("file_path", "")
-            # Extract label from file_path (e.g., "images/IMG_001.jpg" -> "IMG_001")
-            label = Path(file_path).stem
-            M = np.array(frame["transform_matrix"], dtype=float)
-            if M.shape == (3, 4):
-                M = np.vstack([M, [0, 0, 0, 1]])
-            camera_poses_dict[label] = M
+        applied_transform = transforms_json.get("applied_transform")
+        if applied_transform is not None:
+            applied_transform_np = np.array(applied_transform, dtype=float)
+            if applied_transform_np.shape == (3, 4):
+                applied_transform_np = _to_homogeneous_4x4(applied_transform_np)
+        else:
+            applied_transform_np = default_applied_transform()
+        applied_transform_np = np.array(applied_transform_np, dtype=float)
 
-        # Match cameras by label or use order
-        camera_poses = []
-        camera_transforms_positions = []
-        for label in camera_labels:
-            if label in camera_poses_dict:
-                camera_poses.append(camera_poses_dict[label])
-                camera_transforms_positions.append(camera_poses_dict[label][:3, 3])
-            else:
-                # Fallback: try to match by index (not ideal but better than crashing)
-                idx = len(camera_poses)
-                if idx < len(camera_poses_dict):
-                    all_poses = list(camera_poses_dict.values())
-                    camera_poses.append(all_poses[idx])
-                    camera_transforms_positions.append(all_poses[idx][:3, 3])
-
-        if len(camera_poses) == 0:
-            raise ValueError("No matching camera poses found in transforms.json")
-
-        camera_poses = np.array(camera_poses)
-        camera_transforms_positions = np.array(camera_transforms_positions)
-
-        # Step 3: Fit Umeyama: UTM → transforms.json positions (NOT CAMERAS.xml local!)
-        s_fit, R_fit, t_fit = umeyama(camera_utm, camera_transforms_positions, with_scale=True)
-
-        CONSOLE.log("[cyan]═══ Marker Transformation Debug (FIXED) ═══[/cyan]")
-        CONSOLE.log(f"[cyan]Umeyama fit (UTM → transforms.json):[/cyan]")
-        CONSOLE.log(f"  Scale: {s_fit:.6f}")
-        CONSOLE.log(f"  Camera UTM mean: {camera_utm.mean(axis=0)}")
-        CONSOLE.log(f"  Camera transforms.json mean: {camera_transforms_positions.mean(axis=0)}")
-
-        # Step 4: Load markers from reference.xml (UTM coordinates)
         markers_ref = _parse_markers(reference_xml, None)
         if len(markers_ref) == 0:
             raise ValueError("No markers found in reference.xml")
 
         marker_labels = sorted(markers_ref.keys())
-        markers_utm = np.stack([markers_ref[label] for label in marker_labels])
+        markers_transforms = []
+        for label in marker_labels:
+            utm_point = markers_ref[label]
+            ecef_point, _, _ = _utm_to_ecef(utm_point[0], utm_point[1], utm_point[2], zone=self.config.utm_zone)
+            chunk_local = component_transform.inverse_rotation @ (
+                (ecef_point - component_transform.translation_ecef) / component_transform.scale
+            )
+            component_space = component_transform.rotation @ chunk_local + (
+                component_transform.translation_ecef / component_transform.scale
+            )
+            pos_transforms = apply_4x4(applied_transform_np, component_space)
+            markers_transforms.append(pos_transforms)
 
-        # Step 5: Transform markers: UTM → transforms.json coordinate system
-        markers_transforms = apply_similarity(s_fit, R_fit, t_fit, markers_utm)
+        markers_transforms = np.stack(markers_transforms)
 
         CONSOLE.log(f"[cyan]Markers (transforms.json coords, BEFORE auto_orient):[/cyan]")
         CONSOLE.log(f"  Range: [{markers_transforms.min(axis=0)}, {markers_transforms.max(axis=0)}]")
         CONSOLE.log(f"  Mean: {markers_transforms.mean(axis=0)}")
 
         # Apply auto_orient_and_center_poses (mimics nerfstudio_dataparser.py:237-241)
-        poses_torch = torch.from_numpy(camera_poses.astype(np.float32))
+        camera_poses = []
+        for frame in transforms_json.get("frames", []):
+            matrix = np.array(frame["transform_matrix"], dtype=float)
+            if matrix.shape == (3, 4):
+                matrix = np.vstack([matrix, [0, 0, 0, 1]])
+            camera_poses.append(matrix)
+        if len(camera_poses) == 0:
+            raise ValueError("No camera poses found in transforms.json")
+
+        camera_poses_np = np.array(camera_poses)
+        poses_torch = torch.from_numpy(camera_poses_np.astype(np.float32))
         oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
             poses_torch,
             method=self.config.orientation_method,
@@ -429,32 +575,22 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             scale_factor /= float(torch.max(torch.abs(oriented_poses[:, :3, 3])))
         scale_factor *= self.config.scale_factor
 
-        # Step 6: Apply same transformation to markers (auto_orient + scale)
         transform_matrix_np = transform_matrix.numpy()
         transform_4x4 = _to_homogeneous_4x4(transform_matrix_np)
 
         markers_model = {}
         marker_positions = []
 
-        for label in marker_labels:
-            # Get marker position in transforms.json coords (before auto_orient)
-            idx = marker_labels.index(label)
-            pos_transforms = markers_transforms[idx]
-
-            # Apply transform_matrix (auto_orient)
+        for label, pos_transforms in zip(marker_labels, markers_transforms):
             pos_4d = np.append(pos_transforms, 1.0)
             pos_oriented = (transform_4x4 @ pos_4d)[:3]
-
-            # Apply scale_factor
             pos_model = pos_oriented * scale_factor
             markers_model[label] = pos_model
             marker_positions.append(pos_model)
 
-        # Compute plane from transformed markers
         marker_positions = np.array(marker_positions)
         plane_model = plane_from_points(marker_positions)
 
-        # DEBUG: Log AFTER transformation
         camera_positions_model = oriented_poses[:, :3, 3].numpy() * scale_factor
         CONSOLE.log(f"[green]Camera positions (Model Space):[/green]")
         CONSOLE.log(f"  Range: [{camera_positions_model.min(axis=0)}, {camera_positions_model.max(axis=0)}]")
@@ -510,6 +646,7 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
                 reference_xml=reference_xml,
                 markers_xml=markers_xml,
                 applied_transform_4x4=applied_transform_np,
+                utm_zone=self.config.utm_zone,
             )
 
             # Step 2: Transform to model space (pass XMLs to refit markers directly)
