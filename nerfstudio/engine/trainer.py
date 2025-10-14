@@ -38,14 +38,16 @@ from rich.table import Table
 from torch.cuda.amp.grad_scaler import GradScaler
 
 from nerfstudio.configs.experiment_config import ExperimentConfig
-try:
-    import plotly.graph_objects as go
-except Exception:  # pragma: no cover - plotly is optional
-    go = None
-try:
-    from nerfstudio.utils import plotly_utils
-except Exception:  # pragma: no cover - plotly extras optional
-    plotly_utils = None
+try:  # pragma: no cover - matplotlib is optional at runtime
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # type: ignore
+    from matplotlib.lines import Line2D  # type: ignore
+    from matplotlib.patches import Patch  # type: ignore
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # register 3D projection
+except Exception:  # pragma: no cover - matplotlib optional
+    plt = None  # type: ignore
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
@@ -537,44 +539,72 @@ class Trainer:
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        def _export_plotly() -> None:
-            assert go is not None and plotly_utils is not None
-            html_path = self.checkpoint_dir / "camera_distribution.html"
-
-            data: List[Any] = []
-
-            for idx, (name, positions, directions) in enumerate(splits):
-                color = plotly_utils.get_random_color(idx=idx)
-                pos_np = positions.detach().cpu().numpy()
-                dir_np = directions.detach().cpu().numpy()
-                norms = np.linalg.norm(dir_np, axis=1, keepdims=True)
-                dir_np = np.divide(dir_np, np.maximum(norms, 1e-8)) * arrow_length
-
-                data.append(
-                    go.Scatter3d(  # type: ignore
-                        x=pos_np[:, 0],
-                        y=pos_np[:, 1],
-                        z=pos_np[:, 2],
-                        mode="markers",
-                        name=f"{name} cameras",
-                        legendgroup=name,
-                        marker=dict(size=4, color=color, opacity=0.9),
-                    )
+        def _export_matplotlib() -> None:
+            if plt is None:
+                CONSOLE.log(
+                    "Matplotlib unavailable; skipping camera distribution plot.",
+                    style="yellow",
                 )
+                return
 
-                line_tensor = torch.from_numpy(np.stack([pos_np, pos_np + dir_np], axis=1)).float()
-                line_traces = plotly_utils.get_line_segments_from_lines(
-                    line_tensor,
-                    color=color,
-                    marker_color=color,
-                    draw_marker=False,
-                    line_width=3,
-                )
-                for trace in line_traces:
-                    trace.update(legendgroup=name, showlegend=False)
-                    data.append(trace)
+            png_path = self.checkpoint_dir / "camera_distribution.png"
+            fig = plt.figure(figsize=(8, 8))
+            ax = fig.add_subplot(111, projection="3d")
+
+            cmap = plt.get_cmap("tab10")
 
             plane_info = ""
+            plane_plotted = False
+
+            marker_positions_np: Optional[np.ndarray] = None
+            marker_labels_plot: Optional[List[str]] = None
+
+            if train_outputs is not None:
+                train_metadata = getattr(train_outputs, "metadata", {})
+                water_surface_meta = train_metadata.get("water_surface") if isinstance(train_metadata, dict) else None
+                if water_surface_meta is not None:
+                    markers_model = water_surface_meta.get("markers_model")
+                    if markers_model:
+                        marker_labels_plot = water_surface_meta.get("marker_labels") or list(markers_model.keys())
+                        marker_positions_np = np.array(
+                            [markers_model[label] for label in marker_labels_plot],
+                            dtype=float,
+                        )
+
+            for idx, (name, positions, directions) in enumerate(splits):
+                color = cmap(idx % cmap.N)
+                pos_np = positions.detach().cpu().numpy()
+                dir_np = directions.detach().cpu().numpy()
+
+                if pos_np.size == 0:
+                    continue
+
+                norms = np.linalg.norm(dir_np, axis=1, keepdims=True)
+                dir_unit = np.divide(dir_np, np.maximum(norms, 1e-8))
+
+                ax.scatter(
+                    pos_np[:, 0],
+                    pos_np[:, 1],
+                    pos_np[:, 2],
+                    label=f"{name} cameras",
+                    color=color,
+                    s=20,
+                    depthshade=False,
+                )
+
+                ax.quiver(
+                    pos_np[:, 0],
+                    pos_np[:, 1],
+                    pos_np[:, 2],
+                    dir_unit[:, 0],
+                    dir_unit[:, 1],
+                    dir_unit[:, 2],
+                    length=arrow_length,
+                    normalize=True,
+                    color=color,
+                    linewidths=1.0,
+                )
+
             if normal is not None and offset is not None:
                 try:
                     normal_tensor = torch.as_tensor(normal).detach().cpu().view(-1).float()
@@ -585,7 +615,6 @@ class Trainer:
                         normal_unit = normal_np / norm
                         point_on_plane = -offset_val * normal_unit
 
-                        # Build orthonormal basis for the plane.
                         basis = np.array([1.0, 0.0, 0.0])
                         if abs(np.dot(basis, normal_unit)) > 0.95:
                             basis = np.array([0.0, 1.0, 0.0])
@@ -608,18 +637,17 @@ class Trainer:
                                 + tangent_v[None, None, :] * vv[..., None]
                             )
 
-                            surface = go.Surface(  # type: ignore
-                                x=plane_points[..., 0],
-                                y=plane_points[..., 1],
-                                z=plane_points[..., 2],
-                                name="water surface",
-                                opacity=0.35,
-                                showscale=False,
-                                showlegend=True,
-                                legendgroup="water",
-                                colorscale=[[0.0, "rgba(0,152,255,0.6)"], [1.0, "rgba(0,152,255,0.6)"]],
+                            ax.plot_surface(
+                                plane_points[..., 0],
+                                plane_points[..., 1],
+                                plane_points[..., 2],
+                                color=(0.0, 0.6, 1.0, 0.35),
+                                linewidth=0,
+                                antialiased=False,
+                                shade=False,
+                                alpha=0.4,
                             )
-                            data.append(surface)
+                            plane_plotted = True
 
                             if abs(normal_unit[2]) > 1e-6:
                                 water_z = -offset_val / normal_unit[2]
@@ -631,43 +659,63 @@ class Trainer:
                                 plane_info = (
                                     f"Water plane n=[{normal_unit[0]:.2f}, {normal_unit[1]:.2f}, {normal_unit[2]:.2f}] (vertical)"
                                 )
-                except Exception as exc:  # pragma: no cover - plotly export best effort
+                except Exception as exc:  # pragma: no cover - visualization best effort
                     CONSOLE.print(f"[yellow]Warning: Could not visualise water surface: {exc}[/yellow]")
 
+            marker_handles: List[Line2D] = []
+            if marker_positions_np is not None and marker_labels_plot is not None:
+                ax.scatter(
+                    marker_positions_np[:, 0],
+                    marker_positions_np[:, 1],
+                    marker_positions_np[:, 2],
+                    color="red",
+                    s=40,
+                    depthshade=False,
+                    marker="o",
+                )
+                for label, position in zip(marker_labels_plot, marker_positions_np):
+                    ax.text(
+                        position[0],
+                        position[1],
+                        position[2],
+                        f" {label}",
+                        color="red",
+                        fontsize=10,
+                    )
+                marker_handles.append(
+                    Line2D([0], [0], marker="o", color="w", markerfacecolor="red", markersize=6, linestyle="None", label="water markers")
+                )
+
             x_margin = max_extent * 0.1
-            xyz_range = {
-                "x": [float(min_bounds[0] - x_margin), float(max_bounds[0] + x_margin)],
-                "y": [float(min_bounds[1] - x_margin), float(max_bounds[1] + x_margin)],
-                "z": [float(min_bounds[2] - x_margin), float(max_bounds[2] + x_margin)],
-            }
+            ax.set_xlim(float(min_bounds[0] - x_margin), float(max_bounds[0] + x_margin))
+            ax.set_ylim(float(min_bounds[1] - x_margin), float(max_bounds[1] + x_margin))
+            ax.set_zlim(float(min_bounds[2] - x_margin), float(max_bounds[2] + x_margin))
 
-            layout = go.Layout(  # type: ignore
-                title="Camera distribution in NeRF space" + (f"<br>{plane_info}" if plane_info else ""),
-                legend=dict(itemsizing="constant"),
-                margin=dict(l=0, r=0, t=60, b=0),
-                scene=dict(
-                    aspectmode="data",
-                    xaxis=dict(title="x", range=xyz_range["x"]),
-                    yaxis=dict(title="y", range=xyz_range["y"]),
-                    zaxis=dict(title="z", range=xyz_range["z"]),
-                ),
-            )
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_zlabel("z")
+            handles, labels_existing = ax.get_legend_handles_labels()
+            if plane_plotted:
+                handles.append(Patch(facecolor=(0.0, 0.6, 1.0, 0.35), edgecolor="none", label="water surface"))
+                labels_existing.append("water surface")
+            handles.extend(marker_handles)
+            labels_existing.extend([handle.get_label() for handle in marker_handles])
+            if handles:
+                ax.legend(handles, labels_existing, loc="upper right")
+            ax.set_title("Camera distribution in NeRF space")
 
-            fig = go.Figure(data=data, layout=layout)  # type: ignore
-            fig.update_layout(scene_camera=dict(up=dict(x=0, y=0, z=1)))
-            fig.write_html(html_path, include_plotlyjs="cdn")
-            CONSOLE.log(f"Saved interactive camera distribution to: {html_path}")
+            fig.tight_layout()
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
 
-        if go is not None and plotly_utils is not None:
-            try:
-                _export_plotly()
-            except Exception as exc:  # pragma: no cover - plotly export best effort
-                CONSOLE.print(f"[yellow]Warning: Plotly export failed: {exc}[/yellow]")
-        else:
-            CONSOLE.log(
-                "Plotly unavailable; skipping interactive camera distribution plot.",
-                style="yellow",
-            )
+            if plane_info:
+                CONSOLE.log(plane_info)
+            CONSOLE.log(f"Saved camera distribution plot to: {png_path}")
+
+        try:
+            _export_matplotlib()
+        except Exception as exc:  # pragma: no cover - visualization best effort
+            CONSOLE.print(f"[yellow]Warning: Camera distribution plot failed: {exc}[/yellow]")
 
     @check_main_thread
     def save_checkpoint(self, step: int) -> None:

@@ -121,6 +121,33 @@ def _parse_markers(reference_xml: Path, markers_xml: Optional[Path]) -> Dict[str
     return base_markers
 
 
+def _extract_chunk_transform(paths: List[Path]) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
+    """Look for <chunk><transform> blocks and extract (scale, rotation, translation)."""
+    for candidate in paths:
+        if candidate is None or not candidate.exists():
+            continue
+        try:
+            root = ET.parse(str(candidate)).getroot()
+        except ET.ParseError:
+            continue
+        chunk_transform = root.find(".//chunk/transform")
+        if chunk_transform is None:
+            continue
+        rotation_text = chunk_transform.findtext("rotation")
+        translation_text = chunk_transform.findtext("translation")
+        scale_text = chunk_transform.findtext("scale")
+        if rotation_text is None or translation_text is None or scale_text is None:
+            continue
+        try:
+            rotation = np.fromstring(rotation_text, sep=" ").reshape(3, 3)
+            translation = np.fromstring(translation_text, sep=" ")
+            scale = float(scale_text)
+        except ValueError:
+            continue
+        return float(scale), rotation, translation
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Coordinate transforms
 
@@ -181,6 +208,17 @@ def compute_water_markers(
     utm_positions = np.stack([row.ref_utm for row in cameras])
     local_centers = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
     similarity = umeyama(utm_positions, local_centers, with_scale=True)
+    candidate_paths = [cameras_xml, reference_xml]
+    if markers_xml is not None:
+        candidate_paths.append(markers_xml)
+    chunk_transform = _extract_chunk_transform(candidate_paths)
+    if chunk_transform is not None:
+        s_chunk, R_chunk, t_chunk = chunk_transform
+        if s_chunk != 0:
+            s_inv = 1.0 / float(s_chunk)
+            R_inv = R_chunk.T
+            t_inv = -(R_inv @ t_chunk) * s_inv
+            similarity = (s_inv, R_inv, t_inv)
 
     markers_ref = _parse_markers(reference_xml, markers_xml)
     if len(markers_ref) == 0:
@@ -372,6 +410,15 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             metadata["plane_world"] = {
                 "normal": result.plane_ns_world[0].tolist(),
                 "d": float(result.plane_ns_world[1]),
+            }
+
+        if result.markers_ns_world:
+            metadata["markers_ns_world"] = {
+                label: value.tolist() for label, value in result.markers_ns_world.items()
+            }
+        if result.markers_model is not None:
+            metadata["markers_model"] = {
+                label: value.tolist() for label, value in result.markers_model.items()
             }
 
         if self.config.store_full_marker_metadata:
