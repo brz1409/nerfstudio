@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple, Type
 import numpy as np
 import xml.etree.ElementTree as ET
 
-from nerfstudio.data.dataparser.nerfstudio_dataparser import (
+from nerfstudio.data.dataparsers.nerfstudio_dataparser import (
     Nerfstudio as NerfstudioDataParser,
     NerfstudioDataParserConfig,
 )
