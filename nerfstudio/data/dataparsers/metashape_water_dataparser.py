@@ -160,6 +160,8 @@ class WaterMarkersResult:
     # Debug
     used_c2w: bool
     utm_to_local: Tuple[float, np.ndarray, np.ndarray]  # (s,R,t)
+    fit_method: str
+    chunk_transform: Optional[Tuple[float, np.ndarray, np.ndarray]]
 
 
 def compute_water_markers(
@@ -173,6 +175,36 @@ def compute_water_markers(
     """
     Liest Kameras+Referenzen und Marker (UTM) und liefert transformierte Marker.
     """
+    chunk_transform: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
+    candidate_paths = []
+    for candidate in (cameras_xml, reference_xml, markers_xml):
+        if candidate is None:
+            continue
+        candidate_paths.append(Path(candidate))
+    for candidate in candidate_paths:
+        if not candidate.exists():
+            continue
+        try:
+            root_candidate = ET.parse(str(candidate)).getroot()
+        except ET.ParseError:
+            continue
+        chunk_node = root_candidate.find(".//chunk/transform")
+        if chunk_node is None:
+            continue
+        rot_text = chunk_node.findtext("rotation")
+        trans_text = chunk_node.findtext("translation")
+        scale_text = chunk_node.findtext("scale")
+        if rot_text is None or trans_text is None or scale_text is None:
+            continue
+        try:
+            R_chunk = np.fromstring(rot_text, sep=" ").reshape(3, 3)
+            t_chunk = np.fromstring(trans_text, sep=" ")
+            s_chunk = float(scale_text)
+        except ValueError:
+            continue
+        chunk_transform = (s_chunk, R_chunk, t_chunk)
+        break
+
     # 1) Kameras + UTM-Referenzen
     cams = _parse_cameras_with_refs(Path(cameras_xml))
     utm, local_c2w, local_w2c = [], [], []
@@ -206,6 +238,13 @@ def compute_water_markers(
     # 4) UTM → Local
     labels = sorted(markers_ref.keys())
     P_utm = np.stack([markers_ref[k] for k in labels])
+    fit_method = "chunk_transform" if chunk_transform is not None else "umeyama"
+    if chunk_transform is not None:
+        s_chunk, R_chunk, t_chunk = chunk_transform
+        s = 1.0 / float(s_chunk)
+        R = R_chunk.T
+        t = -(R @ t_chunk) / float(s_chunk)
+        use_c2w = True
     P_local = apply_similarity(s, R, t, P_utm)
 
     # 5) Local → Nerfstudio-World (applied_transform)
@@ -236,6 +275,8 @@ def compute_water_markers(
         plane_model=plane_mod,
         used_c2w=use_c2w,
         utm_to_local=(s, R, t),
+        fit_method=fit_method,
+        chunk_transform=chunk_transform,
     )
 
 
@@ -252,6 +293,7 @@ def to_metadata_dict(res: WaterMarkersResult) -> Dict:
                 "R": res.utm_to_local[1].tolist(),
                 "t": res.utm_to_local[2].tolist(),
             },
+            "fit_method": res.fit_method,
         }
     }
     if res.markers_model is not None:
@@ -262,6 +304,13 @@ def to_metadata_dict(res: WaterMarkersResult) -> Dict:
     if res.plane_model is not None:
         n, d = res.plane_model
         md["water_markers"]["plane_model"] = {"n": n.tolist(), "d": float(d)}
+    if res.chunk_transform is not None:
+        scale_chunk, R_chunk, t_chunk = res.chunk_transform
+        md["water_markers"]["chunk_transform"] = {
+            "scale": float(scale_chunk),
+            "rotation": R_chunk.tolist(),
+            "translation": t_chunk.tolist(),
+        }
     return md
 
 
@@ -386,12 +435,21 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             "marker_count": len(result.markers_ns_world),
             "marker_labels": sorted(result.markers_ns_world.keys()),
             "used_c2w": bool(result.used_c2w),
+            "fit_method": result.fit_method,
         }
 
         if result.plane_ns_world is not None:
             meta["plane_world"] = {
                 "normal": result.plane_ns_world[0].tolist(),
                 "d": float(result.plane_ns_world[1]),
+            }
+
+        if result.chunk_transform is not None:
+            scale_chunk, R_chunk, t_chunk = result.chunk_transform
+            meta["chunk_transform"] = {
+                "scale": float(scale_chunk),
+                "rotation": R_chunk.tolist(),
+                "translation": t_chunk.tolist(),
             }
 
         if self.config.store_full_marker_metadata:
