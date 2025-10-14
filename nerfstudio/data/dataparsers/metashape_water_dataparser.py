@@ -239,12 +239,6 @@ def compute_water_markers(
     plane_model: Optional[Tuple[np.ndarray, float]] = None
     if dataparser_transform_4x4 is not None and scene_scale is not None:
         to_model = np.array(dataparser_transform_4x4, dtype=float)
-        if applied_transform_4x4 is not None:
-            try:
-                applied_inv = np.linalg.inv(np.array(applied_transform_4x4, dtype=float))
-                to_model = to_model @ applied_inv  # saved → final (remove original-space component)
-            except np.linalg.LinAlgError:
-                pass
         points_model = np.stack([apply_4x4(to_model, point) for point in points_ns]) * float(scene_scale)
         markers_model = {label: points_model[idx] for idx, label in enumerate(labels)}
         if len(labels) >= 3:
