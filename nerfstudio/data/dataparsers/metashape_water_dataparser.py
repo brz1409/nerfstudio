@@ -121,39 +121,19 @@ def _parse_markers(reference_xml: Path, markers_xml: Optional[Path]) -> Dict[str
     return base_markers
 
 
-def _extract_chunk_transform(paths: List[Path]) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
-    """Look for <chunk><transform> blocks and extract (scale, rotation, translation)."""
-    for candidate in paths:
-        if candidate is None or not candidate.exists():
-            continue
-        try:
-            root = ET.parse(str(candidate)).getroot()
-        except ET.ParseError:
-            continue
-        chunk_transform = root.find(".//chunk/transform")
-        if chunk_transform is None:
-            continue
-        rotation_text = chunk_transform.findtext("rotation")
-        translation_text = chunk_transform.findtext("translation")
-        scale_text = chunk_transform.findtext("scale")
-        if rotation_text is None or translation_text is None or scale_text is None:
-            continue
-        try:
-            rotation = np.fromstring(rotation_text, sep=" ").reshape(3, 3)
-            translation = np.fromstring(translation_text, sep=" ")
-            scale = float(scale_text)
-        except ValueError:
-            continue
-        return float(scale), rotation, translation
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Coordinate transforms
 
 def camera_center_from_c2w(matrix: np.ndarray) -> np.ndarray:
     """Extract camera center from camera-to-world transform (translation component)."""
     return matrix[:3, 3]
+
+
+def camera_center_from_w2c(matrix: np.ndarray) -> np.ndarray:
+    """Extract camera center from world-to-camera transform."""
+    rotation = matrix[:3, :3]
+    translation = matrix[:3, 3]
+    return -rotation.T @ translation
 
 
 def default_applied_transform() -> np.ndarray:
@@ -206,20 +186,21 @@ def compute_water_markers(
         raise ValueError("MetashapeWaterDataParser requires at least three cameras with reference coordinates.")
 
     utm_positions = np.stack([row.ref_utm for row in cameras])
-    local_centers = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
-    similarity = umeyama(utm_positions, local_centers, with_scale=True)
-    candidate_paths = [cameras_xml, reference_xml]
-    if markers_xml is not None:
-        candidate_paths.append(markers_xml)
-    chunk_transform = _extract_chunk_transform(candidate_paths)
-    if chunk_transform is not None:
-        s_chunk, R_chunk, t_chunk = chunk_transform
-        if s_chunk != 0:
-            s_inv = 1.0 / float(s_chunk)
-            R_inv = R_chunk.T
-            t_inv = -(R_inv @ t_chunk) * s_inv
-            similarity = (s_inv, R_inv, t_inv)
+    local_centers_c2w = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
+    local_centers_w2c = np.stack([camera_center_from_w2c(row.matrix) for row in cameras])
 
+    s_c2w, R_c2w, t_c2w = umeyama(utm_positions, local_centers_c2w, with_scale=True)
+    s_w2c, R_w2c, t_w2c = umeyama(utm_positions, local_centers_w2c, with_scale=True)
+
+    rms_c2w = np.linalg.norm(apply_similarity(s_c2w, R_c2w, t_c2w, utm_positions) - local_centers_c2w, axis=1).mean()
+    rms_w2c = np.linalg.norm(apply_similarity(s_w2c, R_w2c, t_w2c, utm_positions) - local_centers_w2c, axis=1).mean()
+
+    if rms_c2w <= rms_w2c:
+        similarity = (s_c2w, R_c2w, t_c2w)
+        camera_centers_local = local_centers_c2w
+    else:
+        similarity = (s_w2c, R_w2c, t_w2c)
+        camera_centers_local = local_centers_w2c
     markers_ref = _parse_markers(reference_xml, markers_xml)
     if len(markers_ref) == 0:
         raise ValueError("MetashapeWaterDataParser could not find any water markers in the provided XML files.")
@@ -239,6 +220,12 @@ def compute_water_markers(
     plane_model: Optional[Tuple[np.ndarray, float]] = None
     if dataparser_transform_4x4 is not None and scene_scale is not None:
         to_model = np.array(dataparser_transform_4x4, dtype=float)
+        if applied_transform_4x4 is not None:
+            try:
+                applied_inv = np.linalg.inv(np.array(applied_transform_4x4, dtype=float))
+                to_model = to_model @ applied_inv
+            except np.linalg.LinAlgError:
+                pass
         points_model = np.stack([apply_4x4(to_model, point) for point in points_ns]) * float(scene_scale)
         markers_model = {label: points_model[idx] for idx, label in enumerate(labels)}
         if len(labels) >= 3:
