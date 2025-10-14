@@ -160,31 +160,48 @@ def apply_similarity(scale: float, rotation: np.ndarray, translation: np.ndarray
 # Result container
 
 @dataclass
-class WaterMarkersResult:
+class WaterMarkersNSWorldResult:
+    """Water markers in NS World space (after applied_transform, before auto_orient)."""
     markers_ns_world: Dict[str, np.ndarray]
-    markers_model: Optional[Dict[str, np.ndarray]]
     plane_ns_world: Optional[Tuple[np.ndarray, float]]
-    plane_model: Optional[Tuple[np.ndarray, float]]
-    utm_to_local: Tuple[float, np.ndarray, np.ndarray]
+    utm_to_local: Tuple[float, np.ndarray, np.ndarray]  # (scale, rotation, translation)
 
 
 # ---------------------------------------------------------------------------
 # Core conversion
 
-def compute_water_markers(
+def compute_water_markers_ns_world(
     cameras_xml: Path,
     reference_xml: Path,
     markers_xml: Optional[Path],
     applied_transform_4x4: Optional[np.ndarray],
-    dataparser_transform_4x4: Optional[np.ndarray],
-    scene_scale: Optional[float],
-) -> WaterMarkersResult:
-    """Project Metashape water markers into Nerfstudio dataset space."""
+) -> WaterMarkersNSWorldResult:
+    """Project Metashape water markers into NS World space.
 
+    This function handles the transformation from UTM coordinates to NS World:
+    1. UTM → Local (via Umeyama from camera UTM refs to camera local positions)
+    2. Local → NS World (via applied_transform)
+
+    The transformation to final training space is handled separately by the dataparser.
+
+    Args:
+        cameras_xml: Path to Metashape cameras.xml with camera transforms and UTM references
+        reference_xml: Path to Metashape reference.xml with marker UTM coordinates
+        markers_xml: Optional path to markers.xml that overrides coordinates from reference.xml
+        applied_transform_4x4: The 4x4 applied_transform from transforms.json (or default)
+
+    Returns:
+        WaterMarkersNSWorldResult containing markers and plane in NS World space
+
+    Raises:
+        ValueError: If fewer than 3 cameras with references, or no markers found
+    """
+    # 1. Load cameras with UTM references
     cameras = [row for row in _parse_cameras_with_refs(cameras_xml) if row.ref_utm is not None]
     if len(cameras) < 3:
         raise ValueError("MetashapeWaterDataParser requires at least three cameras with reference coordinates.")
 
+    # 2. Extract camera positions and fit Umeyama (UTM → Local)
     utm_positions = np.stack([row.ref_utm for row in cameras])
     local_centers_c2w = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
     local_centers_w2c = np.stack([camera_center_from_w2c(row.matrix) for row in cameras])
@@ -195,89 +212,52 @@ def compute_water_markers(
     rms_c2w = np.linalg.norm(apply_similarity(s_c2w, R_c2w, t_c2w, utm_positions) - local_centers_c2w, axis=1).mean()
     rms_w2c = np.linalg.norm(apply_similarity(s_w2c, R_w2c, t_w2c, utm_positions) - local_centers_w2c, axis=1).mean()
 
-    if rms_c2w <= rms_w2c:
-        similarity = (s_c2w, R_c2w, t_c2w)
-        camera_centers_local = local_centers_c2w
-    else:
-        similarity = (s_w2c, R_w2c, t_w2c)
-        camera_centers_local = local_centers_w2c
+    # Choose best fit (c2w vs w2c)
+    similarity = (s_c2w, R_c2w, t_c2w) if rms_c2w <= rms_w2c else (s_w2c, R_w2c, t_w2c)
+
+    # 3. Load markers from reference.xml
     markers_ref = _parse_markers(reference_xml, markers_xml)
     if len(markers_ref) == 0:
         raise ValueError("MetashapeWaterDataParser could not find any water markers in the provided XML files.")
 
     labels = sorted(markers_ref.keys())
     points_utm = np.stack([markers_ref[label] for label in labels])
+
+    # 4. Transform UTM → Local
     points_local = apply_similarity(*similarity, points_utm)
 
+    # 5. Transform Local → NS World
     applied_transform = np.array(applied_transform_4x4 if applied_transform_4x4 is not None else default_applied_transform())
     points_ns = np.stack([apply_4x4(applied_transform, point) for point in points_local])
 
+    # 6. Compute plane in NS World
     plane_ns: Optional[Tuple[np.ndarray, float]] = None
     if len(labels) >= 3:
         plane_ns = plane_from_points(points_ns)
 
-    markers_model: Optional[Dict[str, np.ndarray]] = None
-    plane_model: Optional[Tuple[np.ndarray, float]] = None
-    if dataparser_transform_4x4 is not None and scene_scale is not None:
-        to_model = np.array(dataparser_transform_4x4, dtype=float)
-        if applied_transform_4x4 is not None:
-            try:
-                applied_inv = np.linalg.inv(np.array(applied_transform_4x4, dtype=float))
-                to_model = to_model @ applied_inv
-            except np.linalg.LinAlgError:
-                pass
-        points_model = np.stack([apply_4x4(to_model, point) for point in points_ns]) * float(scene_scale)
-        markers_model = {label: points_model[idx] for idx, label in enumerate(labels)}
-        if len(labels) >= 3:
-            plane_model = plane_from_points(points_model)
-
+    # 7. Build result
     markers_ns_world = {label: points_ns[idx] for idx, label in enumerate(labels)}
-    return WaterMarkersResult(
+
+    return WaterMarkersNSWorldResult(
         markers_ns_world=markers_ns_world,
-        markers_model=markers_model,
         plane_ns_world=plane_ns,
-        plane_model=plane_model,
         utm_to_local=similarity,
     )
 
 
 # ---------------------------------------------------------------------------
-# Metadata construction
+# Helper function for coordinate transformation
 
-def to_metadata_dict(result: WaterMarkersResult) -> Dict:
-    """Serialize results for storage inside Dataparser metadata."""
-    metadata: Dict[str, Dict] = {
-        "water_markers": {
-            "markers_ns_world": {label: value.tolist() for label, value in result.markers_ns_world.items()},
-            "utm_to_local": {
-                "scale": float(result.utm_to_local[0]),
-                "rotation": result.utm_to_local[1].tolist(),
-                "translation": result.utm_to_local[2].tolist(),
-            },
-        }
-    }
-    if result.markers_model is not None:
-        metadata["water_markers"]["markers_model"] = {
-            label: value.tolist() for label, value in result.markers_model.items()
-        }
-    if result.plane_ns_world is not None:
-        normal, offset = result.plane_ns_world
-        metadata["water_markers"]["plane_ns_world"] = {"normal": normal.tolist(), "d": float(offset)}
-    if result.plane_model is not None:
-        normal, offset = result.plane_model
-        metadata["water_markers"]["plane_model"] = {"normal": normal.tolist(), "d": float(offset)}
-    return metadata
+def _to_homogeneous_4x4(transform_3x4: np.ndarray) -> np.ndarray:
+    """Expand a 3x4 matrix to 4x4 homogeneous form."""
+    assert transform_3x4.shape == (3, 4), f"Expected (3, 4), got {transform_3x4.shape}"
+    transform_4x4 = np.eye(4, dtype=float)
+    transform_4x4[:3, :] = transform_3x4
+    return transform_4x4
 
 
 # ---------------------------------------------------------------------------
 # Dataparser wiring
-
-def _to_homogeneous(transform_3x4: np.ndarray) -> np.ndarray:
-    """Expand a 3x4 matrix to 4x4 homogeneous form."""
-    assert transform_3x4.shape == (3, 4)
-    transform_4x4 = np.eye(4, dtype=float)
-    transform_4x4[:3, :] = transform_3x4
-    return transform_4x4
 
 
 @dataclass
@@ -315,7 +295,92 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
     # ------------------------------------------------------------------
     # Internal helpers
 
+    def _transform_markers_to_model_space(
+        self,
+        markers_ns_world: Dict[str, np.ndarray],
+        transforms_json: Dict,
+    ) -> Tuple[Dict[str, np.ndarray], Tuple[np.ndarray, float]]:
+        """Transform water markers from NS World to final training space.
+
+        This function ensures markers follow the exact same transformation
+        pipeline as camera positions: auto_orient_and_center_poses + scale_factor.
+
+        Args:
+            markers_ns_world: Markers in NS World coordinates (after applied_transform)
+            transforms_json: The transforms.json dict (to get camera poses)
+
+        Returns:
+            (markers_model, plane_model) where:
+            - markers_model: Dict mapping label -> 3D position in training space
+            - plane_model: (normal, d) of water plane in training space
+        """
+        import torch
+        from nerfstudio.cameras import camera_utils
+
+        # Load camera poses from transforms.json
+        camera_poses = []
+        for frame in transforms_json.get("frames", []):
+            M = np.array(frame["transform_matrix"], dtype=float)
+            # Ensure 4x4
+            if M.shape == (3, 4):
+                M = np.vstack([M, [0, 0, 0, 1]])
+            elif M.shape == (4, 4):
+                pass
+            else:
+                continue
+            camera_poses.append(M)
+
+        if len(camera_poses) == 0:
+            raise ValueError("No camera poses found in transforms.json")
+
+        camera_poses = np.array(camera_poses)
+
+        # Apply auto_orient_and_center_poses (mimics nerfstudio_dataparser.py:237-241)
+        poses_torch = torch.from_numpy(camera_poses.astype(np.float32))
+        oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
+            poses_torch,
+            method=self.config.orientation_method,
+            center_method=self.config.center_method,
+        )
+
+        # Compute scale_factor (mimics nerfstudio_dataparser.py:244-249)
+        scale_factor = 1.0
+        if self.config.auto_scale_poses:
+            scale_factor /= float(torch.max(torch.abs(oriented_poses[:, :3, 3])))
+        scale_factor *= self.config.scale_factor
+
+        # Apply same transformation to markers
+        transform_matrix_np = transform_matrix.numpy()
+        transform_4x4 = _to_homogeneous_4x4(transform_matrix_np)
+
+        markers_model = {}
+        marker_positions = []
+        labels = sorted(markers_ns_world.keys())
+
+        for label in labels:
+            pos_ns = markers_ns_world[label]
+            # Apply transform_matrix
+            pos_4d = np.append(pos_ns, 1.0)
+            pos_oriented = (transform_4x4 @ pos_4d)[:3]
+            # Apply scale_factor
+            pos_model = pos_oriented * scale_factor
+            markers_model[label] = pos_model
+            marker_positions.append(pos_model)
+
+        # Compute plane from transformed markers
+        marker_positions = np.array(marker_positions)
+        plane_model = plane_from_points(marker_positions)
+
+        return markers_model, plane_model
+
     def _compute_water_surface_metadata(self, outputs) -> Optional[Dict]:
+        """Compute water surface metadata using the new simplified pipeline.
+
+        Pipeline:
+        1. Load markers in NS World (compute_water_markers_ns_world)
+        2. Transform to model space (_transform_markers_to_model_space)
+        3. Build metadata dict
+        """
         cameras_xml = self._resolve_path(self.config.cameras_xml)
         reference_xml = self._resolve_path(self.config.reference_xml)
         markers_xml = self._resolve_path(self.config.markers_xml)
@@ -333,48 +398,63 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             missing = [str(path) for path in (cameras_xml, reference_xml) if not path.exists()]
             raise FileNotFoundError(f"MetashapeWaterDataParser missing required XML file(s): {missing}")
 
-        transforms = self._load_transforms_json()
-        applied_transform = transforms.get("applied_transform")
+        # Load transforms.json
+        transforms_json = self._load_transforms_json()
+        applied_transform = transforms_json.get("applied_transform")
         if applied_transform is not None:
             applied_transform_np = np.array(applied_transform, dtype=float)
             if applied_transform_np.shape == (3, 4):
-                applied_transform_np = _to_homogeneous(applied_transform_np)
+                applied_transform_np = _to_homogeneous_4x4(applied_transform_np)
         else:
             applied_transform_np = None
 
-        dataparser_transform_np = outputs.dataparser_transform.detach().cpu().numpy()
-        dataparser_transform_np = np.array(dataparser_transform_np, dtype=float)
-        if dataparser_transform_np.shape == (3, 4):
-            dataparser_transform_4x4 = _to_homogeneous(dataparser_transform_np)
-        else:
-            dataparser_transform_4x4 = dataparser_transform_np
-        scene_scale = float(outputs.dataparser_scale)
-
         try:
-            water_result = compute_water_markers(
+            # Step 1: Compute markers in NS World
+            water_result_ns = compute_water_markers_ns_world(
                 cameras_xml=cameras_xml,
                 reference_xml=reference_xml,
                 markers_xml=markers_xml,
                 applied_transform_4x4=applied_transform_np,
-                dataparser_transform_4x4=dataparser_transform_4x4,
-                scene_scale=scene_scale,
             )
+
+            # Step 2: Transform to model space
+            markers_model, plane_model = self._transform_markers_to_model_space(
+                markers_ns_world=water_result_ns.markers_ns_world,
+                transforms_json=transforms_json,
+            )
+
         except Exception as exc:  # pylint: disable=broad-except
             if self.config.require_water_plane:
                 raise
             CONSOLE.log(f"[yellow]MetashapeWaterDataParser: Failed to compute water plane ({exc}).[/yellow]")
             return None
 
-        if water_result.plane_model is None:
-            if self.config.require_water_plane:
-                raise ValueError("MetashapeWaterDataParser could not estimate a water plane from the provided markers.")
-            CONSOLE.log("[yellow]MetashapeWaterDataParser: fewer than three markers; skipping water plane metadata.[/yellow]")
-            return None
+        # Step 3: Build metadata
+        return self._build_water_surface_dict(
+            markers_ns_world=water_result_ns.markers_ns_world,
+            markers_model=markers_model,
+            plane_ns_world=water_result_ns.plane_ns_world,
+            plane_model=plane_model,
+        )
 
-        return self._build_water_surface_dict(water_result)
+    def _build_water_surface_dict(
+        self,
+        markers_ns_world: Dict[str, np.ndarray],
+        markers_model: Dict[str, np.ndarray],
+        plane_ns_world: Optional[Tuple[np.ndarray, float]],
+        plane_model: Tuple[np.ndarray, float],
+    ) -> Dict:
+        """Build metadata dict from water markers and plane.
 
-    def _build_water_surface_dict(self, result: WaterMarkersResult) -> Dict:
-        plane_model = result.plane_model
+        Args:
+            markers_ns_world: Markers in NS World coordinates
+            markers_model: Markers in model (training) coordinates
+            plane_ns_world: Plane in NS World coordinates (normal, d)
+            plane_model: Plane in model coordinates (normal, d)
+
+        Returns:
+            Metadata dict to be stored in dataparser outputs
+        """
         assert plane_model is not None, "plane_model must be available when building metadata."
 
         metadata: Dict[str, Dict] = {
@@ -383,27 +463,25 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
                 "d": float(plane_model[1]),
             },
             "source": "metashape_water_dataparser",
-            "marker_count": len(result.markers_ns_world),
-            "marker_labels": sorted(result.markers_ns_world.keys()),
+            "marker_count": len(markers_ns_world),
+            "marker_labels": sorted(markers_ns_world.keys()),
         }
 
-        if result.plane_ns_world is not None:
+        if plane_ns_world is not None:
             metadata["plane_world"] = {
-                "normal": result.plane_ns_world[0].tolist(),
-                "d": float(result.plane_ns_world[1]),
+                "normal": plane_ns_world[0].tolist(),
+                "d": float(plane_ns_world[1]),
             }
 
-        if result.markers_ns_world:
+        if markers_ns_world:
             metadata["markers_ns_world"] = {
-                label: value.tolist() for label, value in result.markers_ns_world.items()
-            }
-        if result.markers_model is not None:
-            metadata["markers_model"] = {
-                label: value.tolist() for label, value in result.markers_model.items()
+                label: value.tolist() for label, value in markers_ns_world.items()
             }
 
-        if self.config.store_full_marker_metadata:
-            metadata["markers"] = to_metadata_dict(result)["water_markers"]
+        if markers_model:
+            metadata["markers_model"] = {
+                label: value.tolist() for label, value in markers_model.items()
+            }
 
         return metadata
 
