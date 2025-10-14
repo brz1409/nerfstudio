@@ -1,12 +1,19 @@
-# nerfstudio/data/utils/water_markers.py
-# -*- coding: utf-8 -*-
-"""
-Water markers → Nerfstudio space
+# Copyright 2022 the Regents of the University of California,
+# Nerfstudio Team and contributors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Lieste Kameras und Marker aus Metashape-XML, fitted UTM→Local (Umeyama),
-transformiert Marker wie Kameras durch applied_transform und dataparser_transform+scale
-und berechnet eine Wasser-Ebene aus >=3 Punkten.
-"""
+"""Utilities to convert Metashape water markers into Nerfstudio dataset space."""
 
 from __future__ import annotations
 
@@ -17,8 +24,7 @@ from typing import Dict, List, Optional, Tuple, Type
 import numpy as np
 import xml.etree.ElementTree as ET
 
-from nerfstudio.configs.config_utils import to_immutable_dict
-from nerfstudio.data.dataparsers.nerfstudio_dataparser import (
+from nerfstudio.data.dataparser.nerfstudio_dataparser import (
     Nerfstudio as NerfstudioDataParser,
     NerfstudioDataParserConfig,
 )
@@ -26,299 +32,229 @@ from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
-# ---------- Mathe/Geometrie ----------
+# ---------------------------------------------------------------------------
+# Linear algebra helpers
 
 def umeyama(A: np.ndarray, B: np.ndarray, with_scale: bool = True) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Ähnlichkeitstransformation B ≈ s * R @ A + t (N×3)."""
-    A = np.asarray(A, float); B = np.asarray(B, float)
+    """Return similarity transform (s, R, t) that maps A → B in least squares sense."""
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
     assert A.shape == B.shape and A.ndim == 2 and A.shape[1] == 3
+
     n = A.shape[0]
     muA, muB = A.mean(0), B.mean(0)
     X, Y = A - muA, B - muB
     U, S, Vt = np.linalg.svd((Y.T @ X) / n)
-    D = np.eye(3);
+    D = np.eye(3)
     if np.linalg.det(U @ Vt) < 0:
         D[-1, -1] = -1
     R = U @ D @ Vt
     varA = (X**2).sum() / n
-    s = (np.trace(np.diag(S) @ D) / varA) if with_scale else 1.0
-    t = muB - s * (R @ muA)
-    return float(s), R, t
-
-
-def rms_of_fit(s: float, R: np.ndarray, t: np.ndarray, A: np.ndarray, B: np.ndarray) -> float:
-    pred = (s * (R @ A.T)).T + t
-    return float(np.sqrt(((pred - B)**2).sum(axis=1).mean()))
+    scale = (np.trace(np.diag(S) @ D) / varA) if with_scale else 1.0
+    translation = muB - scale * (R @ muA)
+    return float(scale), R, translation
 
 
 def plane_from_points(points: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Least-squares Ebene durch >=3 Punkte. Liefert (n, d) mit ||n||=1, n·x + d = 0."""
+    """Fit plane to points (>=3) using least squares; returns (normal, d) with ||normal||=1."""
     assert points.shape[0] >= 3 and points.shape[1] == 3
-    c = points.mean(0)
-    Q = points - c
-    # letzte SV ist Normale
-    _, _, Vt = np.linalg.svd(Q, full_matrices=False)
-    n = Vt[-1]
-    n = n / np.linalg.norm(n)
-    d = -float(n @ c)
-    return n, d
+    centroid = points.mean(0)
+    centered = points - centroid
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    normal = Vt[-1]
+    normal /= np.linalg.norm(normal)
+    offset = -float(normal @ centroid)
+    return normal, offset
 
 
-# ---------- Metashape Parsing ----------
+# ---------------------------------------------------------------------------
+# Parsing helpers
 
 @dataclass
 class CameraRow:
+    """Single camera entry exported by Metashape."""
+
     label: str
-    M: np.ndarray          # 4x4
-    ref_utm: Optional[np.ndarray]  # (3,) or None
+    matrix: np.ndarray  # 4x4 camera-to-world transform
+    ref_utm: Optional[np.ndarray]  # 3-vector world position in UTM coordinates
 
 
 def _parse_cameras_with_refs(cameras_xml: Path) -> List[CameraRow]:
     root = ET.parse(str(cameras_xml)).getroot()
     rows: List[CameraRow] = []
     for cam in root.findall(".//camera"):
-        label = cam.get("label", "")
-        tf = cam.findtext("transform")
-        if tf is None:
+        transform_text = cam.findtext("transform")
+        if transform_text is None:
             continue
-        M = np.fromstring(tf, sep=" ").reshape(4, 4)
-        ref_xyz = None
-        ref = cam.find("reference")
-        if ref is not None and all(k in ref.attrib for k in ("x", "y", "z")):
-            ref_xyz = np.array([float(ref.get("x")), float(ref.get("y")), float(ref.get("z"))], dtype=float)
-        rows.append(CameraRow(label=label, M=M, ref_utm=ref_xyz))
+        matrix = np.fromstring(transform_text, sep=" ").reshape(4, 4)
+        ref_utm = None
+        reference = cam.find("reference")
+        if reference is not None and all(key in reference.attrib for key in ("x", "y", "z")):
+            ref_utm = np.array(
+                [float(reference.get("x")), float(reference.get("y")), float(reference.get("z"))],
+                dtype=float,
+            )
+        rows.append(CameraRow(label=cam.get("label", ""), matrix=matrix, ref_utm=ref_utm))
     return rows
 
 
-def _parse_markers_from_reference_xml(reference_xml: Path) -> Dict[str, np.ndarray]:
-    """Liest <markers><marker label=""><reference x y z/></marker></markers>."""
-    root = ET.parse(str(reference_xml)).getroot()
-    out: Dict[str, np.ndarray] = {}
-    for m in root.findall(".//markers/marker"):
-        label = m.get("label", "")
-        ref = m.find("reference")
-        if label and ref is not None and all(k in ref.attrib for k in ("x", "y", "z")):
-            out[label] = np.array([float(ref.get("x")), float(ref.get("y")), float(ref.get("z"))], dtype=float)
-    return out
+def _parse_markers(reference_xml: Path, markers_xml: Optional[Path]) -> Dict[str, np.ndarray]:
+    """Load marker positions from reference.xml (and optional markers.xml override)."""
+
+    def _load(path: Path, tag: str) -> Dict[str, np.ndarray]:
+        root = ET.parse(str(path)).getroot()
+        markers: Dict[str, np.ndarray] = {}
+        for marker in root.findall(tag):
+            label = marker.get("label", "")
+            reference = marker.find("reference")
+            if label and reference is not None and all(key in reference.attrib for key in ("x", "y", "z")):
+                markers[label] = np.array(
+                    [float(reference.get("x")), float(reference.get("y")), float(reference.get("z"))],
+                    dtype=float,
+                )
+        return markers
+
+    base_markers = _load(reference_xml, ".//markers/marker")
+    if markers_xml is not None and markers_xml.exists():
+        override_markers = _load(markers_xml, ".//marker")
+        base_markers.update(override_markers)
+    return base_markers
 
 
-def _parse_markers_from_markers_xml(markers_xml: Path) -> Dict[str, np.ndarray]:
-    """Liest <markers><marker label=""><reference x y z/></marker></markers> (alternative Datei)."""
-    root = ET.parse(str(markers_xml)).getroot()
-    out: Dict[str, np.ndarray] = {}
-    for m in root.findall(".//marker"):
-        label = m.get("label", "")
-        ref = m.find("reference")
-        if label and ref is not None and all(k in ref.attrib for k in ("x", "y", "z")):
-            out[label] = np.array([float(ref.get("x")), float(ref.get("y")), float(ref.get("z"))], dtype=float)
-    return out
+# ---------------------------------------------------------------------------
+# Coordinate transforms
 
-
-# ---------- Transformations ----------
-
-def camera_center_from_c2w(M: np.ndarray) -> np.ndarray:
-    """Bei deinen Metashape-Exports ist die 4x4 eine c2w (Übersetzung = Kamerazentrum)."""
-    return M[:3, 3]
-
-
-def camera_center_from_w2c(M: np.ndarray) -> np.ndarray:
-    """Falls doch w2c: C = -R^T t."""
-    R, t = M[:3, :3], M[:3, 3]
-    return -R.T @ t
+def camera_center_from_c2w(matrix: np.ndarray) -> np.ndarray:
+    """Extract camera center from camera-to-world transform (translation component)."""
+    return matrix[:3, 3]
 
 
 def default_applied_transform() -> np.ndarray:
-    """Standard-Achstausch Metashape→Nerfstudio-World: (z, x, y)."""
-    P = np.array([[0, 0, 1, 0],
-                  [1, 0, 0, 0],
-                  [0, 1, 0, 0],
-                  [0, 0, 0, 1]], dtype=float)
-    return P
+    """Axis permutation from Metashape/OpenCV to Nerfstudio/OpenGL (Z, X, Y)."""
+    return np.array(
+        [[0, 0, 1, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
+        dtype=float,
+    )
 
 
-def apply_4x4(M: np.ndarray, p: np.ndarray) -> np.ndarray:
-    ph = np.concatenate([p, [1.0]])
-    return (M @ ph)[:3]
+def apply_4x4(matrix: np.ndarray, point: np.ndarray) -> np.ndarray:
+    """Apply homogeneous 4x4 transform to a 3-vector."""
+    homogeneous = np.concatenate([point, [1.0]])
+    return (matrix @ homogeneous)[:3]
 
 
-def apply_similarity(s: float, R: np.ndarray, t: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    pts = np.atleast_2d(pts)
-    return (s * (R @ pts.T)).T + t
+def apply_similarity(scale: float, rotation: np.ndarray, translation: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Apply similarity transform with scale, rotation, translation to a set of points."""
+    points = np.atleast_2d(points)
+    return (scale * (rotation @ points.T)).T + translation
 
 
-# ---------- Haupt-API ----------
+# ---------------------------------------------------------------------------
+# Result container
 
 @dataclass
 class WaterMarkersResult:
-    # Punkte in verschiedenen Räumen
-    markers_local: Dict[str, np.ndarray]
     markers_ns_world: Dict[str, np.ndarray]
     markers_model: Optional[Dict[str, np.ndarray]]
-    # Ebene (Optional je Raum, falls >=3 Punkte)
     plane_ns_world: Optional[Tuple[np.ndarray, float]]
     plane_model: Optional[Tuple[np.ndarray, float]]
-    # Debug
-    used_c2w: bool
-    utm_to_local: Tuple[float, np.ndarray, np.ndarray]  # (s,R,t)
-    fit_method: str
-    chunk_transform: Optional[Tuple[float, np.ndarray, np.ndarray]]
+    utm_to_local: Tuple[float, np.ndarray, np.ndarray]
 
+
+# ---------------------------------------------------------------------------
+# Core conversion
 
 def compute_water_markers(
     cameras_xml: Path,
     reference_xml: Path,
-    markers_xml: Optional[Path] = None,
-    applied_transform_4x4: Optional[np.ndarray] = None,
-    dataparser_transform_4x4: Optional[np.ndarray] = None,
-    scene_scale: Optional[float] = None,
+    markers_xml: Optional[Path],
+    applied_transform_4x4: Optional[np.ndarray],
+    dataparser_transform_4x4: Optional[np.ndarray],
+    scene_scale: Optional[float],
 ) -> WaterMarkersResult:
-    """
-    Liest Kameras+Referenzen und Marker (UTM) und liefert transformierte Marker.
-    """
-    chunk_transform: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
-    candidate_paths = []
-    for candidate in (cameras_xml, reference_xml, markers_xml):
-        if candidate is None:
-            continue
-        candidate_paths.append(Path(candidate))
-    for candidate in candidate_paths:
-        if not candidate.exists():
-            continue
-        try:
-            root_candidate = ET.parse(str(candidate)).getroot()
-        except ET.ParseError:
-            continue
-        chunk_node = root_candidate.find(".//chunk/transform")
-        if chunk_node is None:
-            continue
-        rot_text = chunk_node.findtext("rotation")
-        trans_text = chunk_node.findtext("translation")
-        scale_text = chunk_node.findtext("scale")
-        if rot_text is None or trans_text is None or scale_text is None:
-            continue
-        try:
-            R_chunk = np.fromstring(rot_text, sep=" ").reshape(3, 3)
-            t_chunk = np.fromstring(trans_text, sep=" ")
-            s_chunk = float(scale_text)
-        except ValueError:
-            continue
-        chunk_transform = (s_chunk, R_chunk, t_chunk)
-        break
+    """Project Metashape water markers into Nerfstudio dataset space."""
 
-    # 1) Kameras + UTM-Referenzen
-    cams = _parse_cameras_with_refs(Path(cameras_xml))
-    utm, local_c2w, local_w2c = [], [], []
-    for c in cams:
-        if c.ref_utm is None:
-            continue
-        utm.append(c.ref_utm)
-        local_c2w.append(camera_center_from_c2w(c.M))
-        local_w2c.append(camera_center_from_w2c(c.M))
-    utm = np.stack(utm)
-    local_c2w = np.stack(local_c2w)
-    local_w2c = np.stack(local_w2c)
+    cameras = [row for row in _parse_cameras_with_refs(cameras_xml) if row.ref_utm is not None]
+    if len(cameras) < 3:
+        raise ValueError("MetashapeWaterDataParser requires at least three cameras with reference coordinates.")
 
-    # 2) Fit: wähle das bessere Modell (c2w vs. w2c) per RMS
-    s1, R1, t1 = umeyama(utm, local_c2w, with_scale=True)
-    s2, R2, t2 = umeyama(utm, local_w2c, with_scale=True)
-    rms1 = rms_of_fit(s1, R1, t1, utm, local_c2w)
-    rms2 = rms_of_fit(s2, R2, t2, utm, local_w2c)
-    use_c2w = rms1 <= rms2
-    s, R, t = (s1, R1, t1) if use_c2w else (s2, R2, t2)
+    utm_positions = np.stack([row.ref_utm for row in cameras])
+    local_centers = np.stack([camera_center_from_c2w(row.matrix) for row in cameras])
+    similarity = umeyama(utm_positions, local_centers, with_scale=True)
 
-    # 3) Marker-UTM einlesen
-    markers_ref = _parse_markers_from_reference_xml(Path(reference_xml))
-    if markers_xml is not None and Path(markers_xml).exists():
-        # ergänze/override aus separater Datei
-        markers_ref.update(_parse_markers_from_markers_xml(Path(markers_xml)))
-
+    markers_ref = _parse_markers(reference_xml, markers_xml)
     if len(markers_ref) == 0:
-        raise ValueError("Keine Marker im REFERENCE/MARKERS-XML gefunden.")
+        raise ValueError("MetashapeWaterDataParser could not find any water markers in the provided XML files.")
 
-    # 4) UTM → Local
     labels = sorted(markers_ref.keys())
-    P_utm = np.stack([markers_ref[k] for k in labels])
-    fit_method = "chunk_transform" if chunk_transform is not None else "umeyama"
-    if chunk_transform is not None:
-        s_chunk, R_chunk, t_chunk = chunk_transform
-        s = 1.0 / float(s_chunk)
-        R = R_chunk.T
-        t = -(R @ t_chunk) / float(s_chunk)
-        use_c2w = True
-    P_local = apply_similarity(s, R, t, P_utm)
+    points_utm = np.stack([markers_ref[label] for label in labels])
+    points_local = apply_similarity(*similarity, points_utm)
 
-    # 5) Local → Nerfstudio-World (applied_transform)
-    A = applied_transform_4x4 if applied_transform_4x4 is not None else default_applied_transform()
-    P_ns = np.stack([apply_4x4(A, p) for p in P_local])
+    applied_transform = np.array(applied_transform_4x4 if applied_transform_4x4 is not None else default_applied_transform())
+    points_ns = np.stack([apply_4x4(applied_transform, point) for point in points_local])
 
-    # 6) NS-World → Model (dataparser_transform + scene_scale)
-    markers_model = None
-    if dataparser_transform_4x4 is not None and scene_scale is not None:
-        P_mod = np.stack([apply_4x4(dataparser_transform_4x4, p) for p in P_ns]) * float(scene_scale)
-        markers_model = {lbl: P_mod[i] for i, lbl in enumerate(labels)}
-
-    # 7) Ebenen (falls >=3 Punkte)
-    plane_ns = plane_mod = None
+    plane_ns: Optional[Tuple[np.ndarray, float]] = None
     if len(labels) >= 3:
-        n_ns, d_ns = plane_from_points(P_ns)
-        plane_ns = (n_ns, float(d_ns))
-        if markers_model is not None:
-            Pm = np.stack([markers_model[k] for k in labels])
-            n_m, d_m = plane_from_points(Pm)
-            plane_mod = (n_m, float(d_m))
+        plane_ns = plane_from_points(points_ns)
 
+    markers_model: Optional[Dict[str, np.ndarray]] = None
+    plane_model: Optional[Tuple[np.ndarray, float]] = None
+    if dataparser_transform_4x4 is not None and scene_scale is not None:
+        to_model = np.array(dataparser_transform_4x4, dtype=float)
+        if applied_transform_4x4 is not None:
+            try:
+                applied_inv = np.linalg.inv(np.array(applied_transform_4x4, dtype=float))
+                to_model = to_model @ applied_inv  # saved → final (remove original-space component)
+            except np.linalg.LinAlgError:
+                pass
+        points_model = np.stack([apply_4x4(to_model, point) for point in points_ns]) * float(scene_scale)
+        markers_model = {label: points_model[idx] for idx, label in enumerate(labels)}
+        if len(labels) >= 3:
+            plane_model = plane_from_points(points_model)
+
+    markers_ns_world = {label: points_ns[idx] for idx, label in enumerate(labels)}
     return WaterMarkersResult(
-        markers_local={lbl: P_local[i] for i, lbl in enumerate(labels)},
-        markers_ns_world={lbl: P_ns[i] for i, lbl in enumerate(labels)},
+        markers_ns_world=markers_ns_world,
         markers_model=markers_model,
         plane_ns_world=plane_ns,
-        plane_model=plane_mod,
-        used_c2w=use_c2w,
-        utm_to_local=(s, R, t),
-        fit_method=fit_method,
-        chunk_transform=chunk_transform,
+        plane_model=plane_model,
+        utm_to_local=similarity,
     )
 
 
-# ---------- Helper für DataparserOutputs.metadata ----------
+# ---------------------------------------------------------------------------
+# Metadata construction
 
-def to_metadata_dict(res: WaterMarkersResult) -> Dict:
-    md = {
+def to_metadata_dict(result: WaterMarkersResult) -> Dict:
+    """Serialize results for storage inside Dataparser metadata."""
+    metadata: Dict[str, Dict] = {
         "water_markers": {
-            "markers_local": {k: v.tolist() for k, v in res.markers_local.items()},
-            "markers_ns_world": {k: v.tolist() for k, v in res.markers_ns_world.items()},
-            "used_c2w": bool(res.used_c2w),
+            "markers_ns_world": {label: value.tolist() for label, value in result.markers_ns_world.items()},
             "utm_to_local": {
-                "scale": float(res.utm_to_local[0]),
-                "R": res.utm_to_local[1].tolist(),
-                "t": res.utm_to_local[2].tolist(),
+                "scale": float(result.utm_to_local[0]),
+                "rotation": result.utm_to_local[1].tolist(),
+                "translation": result.utm_to_local[2].tolist(),
             },
-            "fit_method": res.fit_method,
         }
     }
-    if res.markers_model is not None:
-        md["water_markers"]["markers_model"] = {k: v.tolist() for k, v in res.markers_model.items()}
-    if res.plane_ns_world is not None:
-        n, d = res.plane_ns_world
-        md["water_markers"]["plane_ns_world"] = {"n": n.tolist(), "d": float(d)}
-    if res.plane_model is not None:
-        n, d = res.plane_model
-        md["water_markers"]["plane_model"] = {"n": n.tolist(), "d": float(d)}
-    if res.chunk_transform is not None:
-        scale_chunk, R_chunk, t_chunk = res.chunk_transform
-        md["water_markers"]["chunk_transform"] = {
-            "scale": float(scale_chunk),
-            "rotation": R_chunk.tolist(),
-            "translation": t_chunk.tolist(),
+    if result.markers_model is not None:
+        metadata["water_markers"]["markers_model"] = {
+            label: value.tolist() for label, value in result.markers_model.items()
         }
-    return md
+    if result.plane_ns_world is not None:
+        normal, offset = result.plane_ns_world
+        metadata["water_markers"]["plane_ns_world"] = {"normal": normal.tolist(), "d": float(offset)}
+    if result.plane_model is not None:
+        normal, offset = result.plane_model
+        metadata["water_markers"]["plane_model"] = {"normal": normal.tolist(), "d": float(offset)}
+    return metadata
 
 
-# ---------- Dataparser-Integration ----------
-
+# ---------------------------------------------------------------------------
+# Dataparser wiring
 
 def _to_homogeneous(transform_3x4: np.ndarray) -> np.ndarray:
-    """Extend 3x4 array to 4x4 homogeneous form."""
+    """Expand a 3x4 matrix to 4x4 homogeneous form."""
     assert transform_3x4.shape == (3, 4)
     transform_4x4 = np.eye(4, dtype=float)
     transform_4x4[:3, :] = transform_3x4
@@ -327,25 +263,23 @@ def _to_homogeneous(transform_3x4: np.ndarray) -> np.ndarray:
 
 @dataclass
 class MetashapeWaterDataParserConfig(NerfstudioDataParserConfig):
-    """Config for Metashape water-aware dataparser."""
+    """Config for MetashapeWaterDataParser."""
 
     _target: Type = field(default_factory=lambda: MetashapeWaterDataParser)
-    metashape_xml: Optional[Path] = None
-    """Single Metashape export (e.g. MARKERS_*.xml) containing both cameras and markers."""
     cameras_xml: Optional[Path] = None
-    """Path to Agisoft Metashape cameras.xml containing camera transforms and references."""
+    """Path to Metashape `cameras.xml` containing camera transforms with UTM references."""
     reference_xml: Optional[Path] = None
-    """Path to reference.xml (or equivalent) with water marker world coordinates."""
+    """Path to Metashape `reference.xml` containing marker coordinates."""
     markers_xml: Optional[Path] = None
-    """Optional additional markers XML to merge (overrides entries from reference.xml)."""
+    """Optional extra `markers.xml` file whose entries override coordinates from `reference.xml`."""
     require_water_plane: bool = True
-    """If True, raises when water plane cannot be computed."""
+    """Raise an error when no water plane can be estimated."""
     store_full_marker_metadata: bool = False
-    """Attach full marker coordinates to metadata for debugging."""
+    """Save the full marker bundle inside metadata for debugging."""
 
 
 class MetashapeWaterDataParser(NerfstudioDataParser):
-    """Dataparser that augments Nerfstudio data with water-plane metadata."""
+    """Dataparser that adds water-plane metadata derived from Metashape markers."""
 
     config: MetashapeWaterDataParserConfig
 
@@ -359,54 +293,52 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         metadata["water_surface"] = water_metadata
         return replace(outputs, metadata=metadata)
 
-    # ----- internal helpers -----
+    # ------------------------------------------------------------------
+    # Internal helpers
 
     def _compute_water_surface_metadata(self, outputs) -> Optional[Dict]:
-        cameras_xml: Optional[Path]
-        reference_xml: Optional[Path]
-        markers_xml: Optional[Path]
-
-        combined_xml = self._resolve_path(self.config.metashape_xml)
-        if combined_xml is not None:
-            cameras_xml = combined_xml
-            reference_xml = combined_xml
-            markers_xml = self._resolve_path(self.config.markers_xml)
-        else:
-            cameras_xml = self._resolve_path(self.config.cameras_xml)
-            reference_xml = self._resolve_path(self.config.reference_xml)
-            markers_xml = self._resolve_path(self.config.markers_xml)
+        cameras_xml = self._resolve_path(self.config.cameras_xml)
+        reference_xml = self._resolve_path(self.config.reference_xml)
+        markers_xml = self._resolve_path(self.config.markers_xml)
 
         if cameras_xml is None or reference_xml is None:
+            message = (
+                "MetashapeWaterDataParser requires both `cameras_xml` and `reference_xml` to compute the water plane."
+            )
             if self.config.require_water_plane:
-                raise ValueError(
-                    "MetashapeWaterDataParser requires `metashape_xml` or both `cameras_xml` and `reference_xml` to compute the water plane."
-                )
-            CONSOLE.log("[yellow]MetashapeWaterDataParser: Missing XML inputs, skipping water surface computation.[/yellow]")
+                raise ValueError(message)
+            CONSOLE.log(f"[yellow]{message}[/yellow]")
             return None
 
         if not cameras_xml.exists() or not reference_xml.exists():
-            missing = [str(p) for p in (cameras_xml, reference_xml) if not p.exists()]
-            raise FileNotFoundError(f"MetashapeWaterDataParser: Missing required XML file(s): {missing}")
+            missing = [str(path) for path in (cameras_xml, reference_xml) if not path.exists()]
+            raise FileNotFoundError(f"MetashapeWaterDataParser missing required XML file(s): {missing}")
 
         transforms = self._load_transforms_json()
-        applied_transform_list = transforms.get("applied_transform")
-        applied_transform = None
-        if applied_transform_list is not None:
-            applied_transform = np.array(applied_transform_list, dtype=float)
-            if applied_transform.shape == (3, 4):
-                applied_transform = _to_homogeneous(applied_transform)
-        dataparser_transform = outputs.dataparser_transform.detach().cpu().numpy()
-        dataparser_transform_4x4 = _to_homogeneous(dataparser_transform)
-        dataparser_scale = float(outputs.dataparser_scale)
+        applied_transform = transforms.get("applied_transform")
+        if applied_transform is not None:
+            applied_transform_np = np.array(applied_transform, dtype=float)
+            if applied_transform_np.shape == (3, 4):
+                applied_transform_np = _to_homogeneous(applied_transform_np)
+        else:
+            applied_transform_np = None
+
+        dataparser_transform_np = outputs.dataparser_transform.detach().cpu().numpy()
+        dataparser_transform_np = np.array(dataparser_transform_np, dtype=float)
+        if dataparser_transform_np.shape == (3, 4):
+            dataparser_transform_4x4 = _to_homogeneous(dataparser_transform_np)
+        else:
+            dataparser_transform_4x4 = dataparser_transform_np
+        scene_scale = float(outputs.dataparser_scale)
 
         try:
             water_result = compute_water_markers(
                 cameras_xml=cameras_xml,
                 reference_xml=reference_xml,
-                markers_xml=markers_xml if markers_xml is not None and markers_xml.exists() else None,
-                applied_transform_4x4=applied_transform,
+                markers_xml=markers_xml,
+                applied_transform_4x4=applied_transform_np,
                 dataparser_transform_4x4=dataparser_transform_4x4,
-                scene_scale=dataparser_scale,
+                scene_scale=scene_scale,
             )
         except Exception as exc:  # pylint: disable=broad-except
             if self.config.require_water_plane:
@@ -417,16 +349,16 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         if water_result.plane_model is None:
             if self.config.require_water_plane:
                 raise ValueError("MetashapeWaterDataParser could not estimate a water plane from the provided markers.")
-            CONSOLE.log("[yellow]MetashapeWaterDataParser: Marker count < 3, skipping water plane metadata.[/yellow]")
+            CONSOLE.log("[yellow]MetashapeWaterDataParser: fewer than three markers; skipping water plane metadata.[/yellow]")
             return None
 
         return self._build_water_surface_dict(water_result)
 
     def _build_water_surface_dict(self, result: WaterMarkersResult) -> Dict:
         plane_model = result.plane_model
-        assert plane_model is not None, "plane_model must be available."
+        assert plane_model is not None, "plane_model must be available when building metadata."
 
-        meta: Dict[str, Dict] = {
+        metadata: Dict[str, Dict] = {
             "plane_model": {
                 "normal": plane_model[0].tolist(),
                 "d": float(plane_model[1]),
@@ -434,29 +366,18 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             "source": "metashape_water_dataparser",
             "marker_count": len(result.markers_ns_world),
             "marker_labels": sorted(result.markers_ns_world.keys()),
-            "used_c2w": bool(result.used_c2w),
-            "fit_method": result.fit_method,
         }
 
         if result.plane_ns_world is not None:
-            meta["plane_world"] = {
+            metadata["plane_world"] = {
                 "normal": result.plane_ns_world[0].tolist(),
                 "d": float(result.plane_ns_world[1]),
             }
 
-        if result.chunk_transform is not None:
-            scale_chunk, R_chunk, t_chunk = result.chunk_transform
-            meta["chunk_transform"] = {
-                "scale": float(scale_chunk),
-                "rotation": R_chunk.tolist(),
-                "translation": t_chunk.tolist(),
-            }
-
         if self.config.store_full_marker_metadata:
-            marker_meta = to_metadata_dict(result)
-            meta["markers"] = marker_meta["water_markers"]
+            metadata["markers"] = to_metadata_dict(result)["water_markers"]
 
-        return meta
+        return metadata
 
     def _resolve_path(self, value: Optional[Path]) -> Optional[Path]:
         if value is None:
