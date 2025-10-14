@@ -292,6 +292,34 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         metadata["water_surface"] = water_metadata
         return replace(outputs, metadata=metadata)
 
+    def save_dataparser_transform(self, path: Path) -> None:
+        """Override to save water surface metadata along with transform.
+
+        This ensures markers_model and plane_model are persisted to disk
+        so they can be visualized and used consistently across training runs.
+        """
+        # First, generate outputs to get the metadata
+        outputs = self._generate_dataparser_outputs(split="train")
+
+        # Build the data dict with transform, scale, AND metadata
+        import json
+        data = {
+            "transform": outputs.dataparser_transform.tolist(),
+            "scale": float(outputs.dataparser_scale),
+        }
+
+        # Add water surface metadata if available
+        if "water_surface" in outputs.metadata:
+            data["water_surface"] = outputs.metadata["water_surface"]
+
+        # Write to file
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True)
+        with open(path, "w", encoding="UTF-8") as file:
+            json.dump(data, file, indent=4)
+
+        CONSOLE.log(f"[cyan]Saved dataparser transform with water surface metadata to {path}[/cyan]")
+
     # ------------------------------------------------------------------
     # Internal helpers
 
