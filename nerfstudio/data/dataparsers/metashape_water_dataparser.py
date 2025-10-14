@@ -308,7 +308,7 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
 
         metadata = dict(outputs.metadata)
         metadata["water_surface"] = water_metadata
-        return replace(outputs, metadata=to_immutable_dict(metadata))
+        return replace(outputs, metadata=metadata)
 
     # ----- internal helpers -----
 
