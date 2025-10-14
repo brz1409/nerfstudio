@@ -363,6 +363,18 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
 
         camera_poses = np.array(camera_poses)
 
+        # DEBUG: Log camera and marker positions BEFORE transformation
+        camera_positions_ns = camera_poses[:, :3, 3]
+        CONSOLE.log("[cyan]═══ Marker Transformation Debug ═══[/cyan]")
+        CONSOLE.log(f"[cyan]Camera positions (NS World):[/cyan]")
+        CONSOLE.log(f"  Range: [{camera_positions_ns.min(axis=0)}, {camera_positions_ns.max(axis=0)}]")
+        CONSOLE.log(f"  Mean: {camera_positions_ns.mean(axis=0)}")
+
+        marker_positions_ns = np.array([markers_ns_world[k] for k in sorted(markers_ns_world.keys())])
+        CONSOLE.log(f"[cyan]Marker positions (NS World):[/cyan]")
+        CONSOLE.log(f"  Range: [{marker_positions_ns.min(axis=0)}, {marker_positions_ns.max(axis=0)}]")
+        CONSOLE.log(f"  Mean: {marker_positions_ns.mean(axis=0)}")
+
         # Apply auto_orient_and_center_poses (mimics nerfstudio_dataparser.py:237-241)
         poses_torch = torch.from_numpy(camera_poses.astype(np.float32))
         oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
@@ -398,6 +410,18 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         # Compute plane from transformed markers
         marker_positions = np.array(marker_positions)
         plane_model = plane_from_points(marker_positions)
+
+        # DEBUG: Log AFTER transformation
+        camera_positions_model = oriented_poses[:, :3, 3].numpy() * scale_factor
+        CONSOLE.log(f"[green]Camera positions (Model Space):[/green]")
+        CONSOLE.log(f"  Range: [{camera_positions_model.min(axis=0)}, {camera_positions_model.max(axis=0)}]")
+        CONSOLE.log(f"  Mean: {camera_positions_model.mean(axis=0)}")
+
+        CONSOLE.log(f"[green]Marker positions (Model Space):[/green]")
+        CONSOLE.log(f"  Range: [{marker_positions.min(axis=0)}, {marker_positions.max(axis=0)}]")
+        CONSOLE.log(f"  Mean: {marker_positions.mean(axis=0)}")
+        CONSOLE.log(f"[green]Scale factor: {scale_factor:.6f}[/green]")
+        CONSOLE.log("[cyan]═══════════════════════════════════[/cyan]")
 
         return markers_model, plane_model
 
