@@ -46,6 +46,9 @@ from nerfstudio.utils.math import intersect_aabb
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
+LOG_PREFIX = "[TwoMediaNeRF]"
+
+
 @dataclass
 class TwoMediaVanillaModelConfig(ModelConfig):
     """Two-media Vanilla NeRF with stratified sampling (no occupancy grid)."""
@@ -150,10 +153,27 @@ class TwoMediaNeRFModel(Model):
         # Setup water interface geometry
         self._setup_water_interface()
 
-        CONSOLE.log(
-            f"TwoMediaNeRF initialized: 4 separate MLPs (air/water × coarse/fine), "
-            f"{self.config.num_coarse_samples} coarse + {self.config.num_importance_samples} fine samples per segment"
-        )
+        self._log_model_configuration()
+
+    def _log_model_configuration(self) -> None:
+        """Emit a concise summary of the most relevant model parameters."""
+        cfg = self.config
+        config_parts = [
+            f"air_ior={cfg.air_refractive_index:.3f}",
+            f"water_ior={cfg.water_refractive_index:.3f}",
+            f"interface_eps={cfg.interface_epsilon:.1e}",
+            f"coarse_samples={cfg.num_coarse_samples}",
+            f"fine_samples={cfg.num_importance_samples}",
+            f"eval_chunk={cfg.eval_num_rays_per_chunk}",
+            f"background={cfg.background_color}",
+            f"grad_scaling={'on' if cfg.use_gradient_scaling else 'off'}",
+            f"temporal_distortion={'on' if self.temporal_distortion is not None else 'off'}",
+        ]
+        CONSOLE.log(f"{LOG_PREFIX} Config | " + ", ".join(config_parts))
+
+        scene_box = getattr(self, "scene_box", None)
+        if scene_box is not None:
+            CONSOLE.log(f"{LOG_PREFIX} Scene box | {scene_box.aabb.flatten().tolist()}")
 
     def _setup_water_interface(self) -> None:
         """Compute water surface plane in model coordinates."""
@@ -183,7 +203,7 @@ class TwoMediaNeRFModel(Model):
         normal_tensor = torch.tensor(normal, dtype=torch.float32)
         norm = torch.norm(normal_tensor)
         if norm == 0:
-            CONSOLE.log("[yellow]Water surface metadata contains zero-length normal; ignoring.[/yellow]")
+            CONSOLE.log(f"{LOG_PREFIX} warning: water surface metadata normal has zero length; ignoring entry.")
             return False
 
         normal_tensor = normal_tensor / norm
@@ -223,39 +243,34 @@ class TwoMediaNeRFModel(Model):
             scale: Reference scale factor (if available)
         """
         if show_header:
-            CONSOLE.log(f"[cyan]━━━ Water Surface ({coord_system} → Model) ━━━[/cyan]")
+            header_parts = [f"source={coord_system}", f"scale={scale:.4f}"]
             if input_height is not None:
-                CONSOLE.log(f"  Input ({coord_system}): z = {input_height:.4f}")
+                header_parts.append(f"input_height={input_height:.4f}")
+            CONSOLE.log(f"{LOG_PREFIX} Water surface | " + ", ".join(header_parts))
 
-        # Check if normal has significant z-component (indicates horizontal-ish plane)
+        normal_fmt = "[" + ", ".join(f"{float(v):.4f}" for v in normal_model) + "]"
+
         if abs(normal_model[2]) > 1e-6:
-            # Solve for z when x=0, y=0: n_z * z + d = 0 → z = -d/n_z
-            water_z_model = -d / normal_model[2]
+            water_z_model = -d / float(normal_model[2])
+            cosine = float(abs(normal_model[2]).clamp(-1.0, 1.0))
+            angle_deg = math.degrees(math.acos(cosine))
 
-            # Check angle from horizontal
-            cosine = abs(normal_model[2]).clamp(-1.0, 1.0)
-            angle_rad = torch.acos(cosine).item()
-            angle_deg = math.degrees(angle_rad)
+            summary = [
+                f"model_z={water_z_model:.4f}",
+                f"tilt_deg={angle_deg:.2f}",
+                f"normal={normal_fmt}",
+                f"plane_const={d:.4f}",
+            ]
+            CONSOLE.log(f"{LOG_PREFIX} Water surface | " + ", ".join(summary))
 
-            CONSOLE.log(f"  Output (Model): z ≈ {water_z_model:.4f}")
-            CONSOLE.log(f"  Normal: [{normal_model[0]:.4f}, {normal_model[1]:.4f}, {normal_model[2]:.4f}]")
-            CONSOLE.log(f"  Angle from horizontal: {angle_deg:.2f}°")
-
-            if angle_deg > 5:
-                CONSOLE.log(f"[yellow]  ⚠ WARNING: Water surface is tilted {angle_deg:.1f}° from horizontal![/yellow]")
-                CONSOLE.log(f"[yellow]  This may indicate marker or transform inconsistencies.[/yellow]")
-                CONSOLE.log(f"[yellow]  Please verify the water markers and dataparser configuration.[/yellow]")
-            else:
-                CONSOLE.log(f"[green]  ✓ Water surface is horizontal (angle < 5°)[/green]")
+            if angle_deg > 5.0:
+                CONSOLE.log(
+                    f"{LOG_PREFIX} warning: water surface tilt {angle_deg:.1f}° exceeds 5°; verify markers or transforms."
+                )
         else:
-            # Normal is nearly horizontal → plane is nearly vertical
-            CONSOLE.log(f"[red]  ✗ ERROR: Water surface is VERTICAL in model space![/red]")
-            CONSOLE.log(f"  Normal: {normal_model.tolist()}")
-            CONSOLE.log(f"[red]  This indicates a coordinate system transformation error![/red]")
-            CONSOLE.log(f"[red]  Check your coordinate system parameters and transforms.[/red]")
-
-        CONSOLE.log(f"  Plane equation: {normal_model[0]:.4f}*x + {normal_model[1]:.4f}*y + {normal_model[2]:.4f}*z + {d:.4f} = 0")
-        CONSOLE.log(f"  Reference scale factor: {scale:.4f}")
+            CONSOLE.log(
+                f"{LOG_PREFIX} error: water surface normal is near-horizontal → plane vertical, normal={normal_fmt}, d={d:.4f}."
+            )
 
     def _signed_distance_to_water(self, positions: Tensor) -> Tensor:
         """Compute signed distance to water surface. Positive = above water (air)."""
@@ -278,8 +293,12 @@ class TwoMediaNeRFModel(Model):
         sin2_t = eta**2 * (1.0 - cos_i**2)
 
         # Total internal reflection check
-        if (sin2_t > 1.0).any():
-            CONSOLE.log("[yellow]Warning: Total internal reflection detected (shouldn't happen air→water)[/yellow]")
+        tir_mask = sin2_t > 1.0
+        if tir_mask.any():
+            num_tir = int(tir_mask.sum().item())
+            CONSOLE.log(
+                f"{LOG_PREFIX} warning: total internal reflection detected on {num_tir} rays during air→water refraction."
+            )
             sin2_t = sin2_t.clamp(max=1.0)
 
         cos_t = torch.sqrt(1.0 - sin2_t)
@@ -423,6 +442,7 @@ class TwoMediaNeRFModel(Model):
         water_bundle: Optional[RayBundle] = None
         ray_samples_water_coarse: Optional[RaySamples] = None
         weights_water_coarse = torch.zeros((num_rays, 0, 1), device=device)
+        weights_water_coarse_pdf = weights_water_coarse
         rgb_water_coarse = torch.zeros((num_rays, 0, 3), device=device)
 
         if hits_water.any():
@@ -435,21 +455,6 @@ class TwoMediaNeRFModel(Model):
             # Previously: remaining_dist = far - t_water caused 60%+ samples outside scene!
             t_near_water, t_far_water = self._intersect_scene_box(water_origins, refracted_dirs)
             remaining_dist = t_far_water
-
-            # Log sampling statistics (once per training session)
-            if self.training and not hasattr(self, '_logged_water_sampling'):
-                valid_mask = remaining_dist > 0
-                if valid_mask.any():
-                    old_method = torch.clamp(far - t_water, min=0.0)
-                    CONSOLE.log(
-                        f"[cyan]Water sampling (scene_box AABB intersection):[/cyan]\n"
-                        f"  Rays hitting water: {valid_mask.sum()}/{num_rays}\n"
-                        f"  Mean sampling distance: {remaining_dist[valid_mask].mean():.4f}\n"
-                        f"  Max sampling distance: {remaining_dist[valid_mask].max():.4f}\n"
-                        f"  Old method (far - t_water) would give: {old_method[valid_mask].mean():.4f} mean\n"
-                        f"  Scene box: {self.scene_box.aabb.tolist()}"
-                    )
-                self._logged_water_sampling = True
 
             water_bundle = RayBundle(
                 origins=water_origins,
@@ -470,8 +475,40 @@ class TwoMediaNeRFModel(Model):
                 self.water_field_coarse, ray_samples_water_coarse
             )
 
-            air_transmittance = 1.0 - weights_air_coarse.sum(dim=-2, keepdim=True)
-            weights_water_coarse = weights_water_coarse * air_transmittance
+            weights_water_coarse_pdf = weights_water_coarse
+
+            air_transmittance = torch.clamp(
+                1.0 - weights_air_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            )
+
+            if self.training and not hasattr(self, "_logged_water_sampling"):
+                valid_mask = remaining_dist > 0
+                rays_hit = int(valid_mask.sum().item())
+                stats_parts = [f"rays_hit={rays_hit}/{num_rays}"]
+                if rays_hit > 0:
+                    remaining_vals = remaining_dist[valid_mask]
+                    stats_parts.append(f"mean_far={float(remaining_vals.mean().item()):.3f}")
+                    stats_parts.append(f"max_far={float(remaining_vals.max().item()):.3f}")
+                    old_method = torch.clamp(far - t_water, min=0.0)
+                    old_vals = old_method[valid_mask]
+                    stats_parts.append(f"old_far_mean={float(old_vals.mean().item()):.3f}")
+                air_trans_values = air_transmittance[hits_water].reshape(-1)
+                if air_trans_values.numel() > 0:
+                    trans_mean = float(air_trans_values.mean().item())
+                    trans_min = float(air_trans_values.min().item())
+                    stats_parts.append(f"air_trans_mean={trans_mean:.3f}")
+                    stats_parts.append(f"air_trans_min={trans_min:.3e}")
+                    if trans_min < 1e-3:
+                        CONSOLE.log(
+                            f"{LOG_PREFIX} notice: minimum air transmittance {trans_min:.3e}; water branch may receive few samples."
+                        )
+                scene_box = getattr(self, "scene_box", None)
+                if scene_box is not None:
+                    stats_parts.append(f"scene_box={scene_box.aabb.flatten().tolist()}")
+                CONSOLE.log(f"{LOG_PREFIX} Water sampling | " + ", ".join(stats_parts))
+                self._logged_water_sampling = True
+
+            weights_water_coarse = weights_water_coarse_pdf * air_transmittance
 
         # Fine sampling (air)
         ray_samples_air_fine = self.sampler_pdf(
@@ -489,14 +526,34 @@ class TwoMediaNeRFModel(Model):
 
         if hits_water.any() and water_bundle is not None and ray_samples_water_coarse is not None:
             ray_samples_water_fine = self.sampler_pdf(
-                water_bundle, ray_samples_water_coarse, weights_water_coarse.detach()
+                water_bundle, ray_samples_water_coarse, weights_water_coarse_pdf.detach()
             )
             self._apply_temporal_distortion(ray_samples_water_fine)
             weights_water_fine, rgb_water_fine = self._render_segment(
                 self.water_field_fine, ray_samples_water_fine
             )
 
-            air_transmittance_fine = 1.0 - weights_air_fine.sum(dim=-2, keepdim=True)
+            air_transmittance_fine = torch.clamp(
+                1.0 - weights_air_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            )
+
+            if self.training and not hasattr(self, "_logged_water_fine_sampling"):
+                fine_trans_values = air_transmittance_fine[hits_water].reshape(-1)
+                if fine_trans_values.numel() > 0:
+                    trans_mean = float(fine_trans_values.mean().item())
+                    trans_min = float(fine_trans_values.min().item())
+                    stats = [
+                        f"mean_trans={trans_mean:.3f}",
+                        f"min_trans={trans_min:.3e}",
+                        f"samples={fine_trans_values.numel()}",
+                    ]
+                    CONSOLE.log(f"{LOG_PREFIX} Water fine gating | " + ", ".join(stats))
+                    if trans_min < 1e-3:
+                        CONSOLE.log(
+                            f"{LOG_PREFIX} notice: fine-stage air transmittance floor {trans_min:.3e}; confirm water branch supervision."
+                        )
+                self._logged_water_fine_sampling = True
+
             weights_water_fine = weights_water_fine * air_transmittance_fine
 
         # Aggregate coarse outputs
