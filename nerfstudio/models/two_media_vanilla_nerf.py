@@ -151,12 +151,17 @@ class TwoMediaVanillaModel(Model):
 
         # --- Ensure collider_params is a real dict (not a dataclasses.Field) BEFORE super().populate_modules()
         cp = getattr(self.config, "collider_params", None)
-        if not isinstance(cp, dict) or ("near_plane" not in cp or "far_plane" not in cp):
-            # sensible defaults (Vanilla-ähnlich)
+        if isinstance(cp, dict):
+            cp = dict(cp)  # make sure it's a plain, mutable dict
+        else:
+            # sensible defaults (Vanilla-like)
             cp = {"near_plane": 0.05, "far_plane": 1000.0}
+
         if recommendations_far is not None:
             cp["far_plane"] = float(recommendations_far)
-        self.config.collider_params = to_immutable_dict(cp)
+
+        # IMPORTANT: do NOT use to_immutable_dict() at runtime here
+        self.config.collider_params = cp
 
         # create collider etc.
         super().populate_modules()
