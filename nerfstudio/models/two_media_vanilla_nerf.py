@@ -399,8 +399,9 @@ class TwoMediaVanillaModel(Model):
         f1_air = self.air_field_coarse.forward(rs1)
         f1_water = self.water_field_coarse.forward(rs1)
         # Merge densities/colors based on seg1 medium
-        sigma1 = torch.where(seg1_is_air.unsqueeze(-1), f1_air[FieldHeadNames.DENSITY], f1_water[FieldHeadNames.DENSITY])
-        rgb1 = torch.where(seg1_is_air.unsqueeze(-1).unsqueeze(-1), f1_air[FieldHeadNames.RGB], f1_water[FieldHeadNames.RGB])
+        seg1_air_mask = seg1_is_air[:, None, None]
+        sigma1 = torch.where(seg1_air_mask, f1_air[FieldHeadNames.DENSITY], f1_water[FieldHeadNames.DENSITY])
+        rgb1 = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air[FieldHeadNames.RGB], f1_water[FieldHeadNames.RGB])
         w1 = rs1.get_weights(sigma1)
         rgb_coarse_1 = self.renderer_rgb(rgb=rgb1, weights=w1)
         acc_coarse_1 = self.renderer_accumulation(w1)
@@ -412,8 +413,9 @@ class TwoMediaVanillaModel(Model):
             rs2.frustums.set_offsets(offsets)
         f2_air = self.air_field_coarse.forward(rs2)
         f2_water = self.water_field_coarse.forward(rs2)
-        sigma2 = torch.where(seg2_is_air.unsqueeze(-1), f2_air[FieldHeadNames.DENSITY], f2_water[FieldHeadNames.DENSITY])
-        rgb2 = torch.where(seg2_is_air.unsqueeze(-1).unsqueeze(-1), f2_air[FieldHeadNames.RGB], f2_water[FieldHeadNames.RGB])
+        seg2_air_mask = seg2_is_air[:, None, None]
+        sigma2 = torch.where(seg2_air_mask, f2_air[FieldHeadNames.DENSITY], f2_water[FieldHeadNames.DENSITY])
+        rgb2 = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air[FieldHeadNames.RGB], f2_water[FieldHeadNames.RGB])
         w2 = rs2.get_weights(sigma2)
         # Scale second segment by remaining transmittance of segment-1
         T1 = (1.0 - acc_coarse_1).clamp(min=0.0, max=1.0)[..., None]
@@ -433,8 +435,8 @@ class TwoMediaVanillaModel(Model):
             rs1_fine.frustums.set_offsets(offsets)
         f1_air_f = self.air_field_fine.forward(rs1_fine)
         f1_water_f = self.water_field_fine.forward(rs1_fine)
-        sigma1_f = torch.where(seg1_is_air.unsqueeze(-1), f1_air_f[FieldHeadNames.DENSITY], f1_water_f[FieldHeadNames.DENSITY])
-        rgb1_f = torch.where(seg1_is_air.unsqueeze(-1).unsqueeze(-1), f1_air_f[FieldHeadNames.RGB], f1_water_f[FieldHeadNames.RGB])
+        sigma1_f = torch.where(seg1_air_mask, f1_air_f[FieldHeadNames.DENSITY], f1_water_f[FieldHeadNames.DENSITY])
+        rgb1_f = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air_f[FieldHeadNames.RGB], f1_water_f[FieldHeadNames.RGB])
         w1_f = rs1_fine.get_weights(sigma1_f)
         rgb_fine_1 = self.renderer_rgb(rgb=rgb1_f, weights=w1_f)
         acc_fine_1 = self.renderer_accumulation(w1_f)
@@ -445,8 +447,8 @@ class TwoMediaVanillaModel(Model):
             rs2_fine.frustums.set_offsets(offsets)
         f2_air_f = self.air_field_fine.forward(rs2_fine)
         f2_water_f = self.water_field_fine.forward(rs2_fine)
-        sigma2_f = torch.where(seg2_is_air.unsqueeze(-1), f2_air_f[FieldHeadNames.DENSITY], f2_water_f[FieldHeadNames.DENSITY])
-        rgb2_f = torch.where(seg2_is_air.unsqueeze(-1).unsqueeze(-1), f2_air_f[FieldHeadNames.RGB], f2_water_f[FieldHeadNames.RGB])
+        sigma2_f = torch.where(seg2_air_mask, f2_air_f[FieldHeadNames.DENSITY], f2_water_f[FieldHeadNames.DENSITY])
+        rgb2_f = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air_f[FieldHeadNames.RGB], f2_water_f[FieldHeadNames.RGB])
         w2_f = rs2_fine.get_weights(sigma2_f)
         T1_f = (1.0 - acc_fine_1).clamp(min=0.0, max=1.0)[..., None]
         rgb_fine_2 = self.renderer_rgb(rgb=rgb2_f, weights=w2_f) * T1_f
