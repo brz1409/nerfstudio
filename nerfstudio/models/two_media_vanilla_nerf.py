@@ -149,12 +149,14 @@ class TwoMediaVanillaModel(Model):
                 except Exception:
                     recommendations_far = None
 
-        # If we have a recommended far plane, patch collider params *before* super call
-        if recommendations_far is not None and self.config.collider_params is not None:
-            # keep near plane, set far plane to recommendation
-            cp = dict(self.config.collider_params)
+        # --- Ensure collider_params is a real dict (not a dataclasses.Field) BEFORE super().populate_modules()
+        cp = getattr(self.config, "collider_params", None)
+        if not isinstance(cp, dict) or ("near_plane" not in cp or "far_plane" not in cp):
+            # sensible defaults (Vanilla-ähnlich)
+            cp = {"near_plane": 0.05, "far_plane": 1000.0}
+        if recommendations_far is not None:
             cp["far_plane"] = float(recommendations_far)
-            self.config.collider_params = to_immutable_dict(cp)
+        self.config.collider_params = to_immutable_dict(cp)
 
         # create collider etc.
         super().populate_modules()
