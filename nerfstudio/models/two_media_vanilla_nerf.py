@@ -337,7 +337,8 @@ class TwoMediaNeRFModel(Model):
         aabb_flat = self.scene_box.aabb.flatten().to(device)
 
         # Use nerfstudio's standard AABB intersection (same as Camera uses)
-        t_near, t_far = intersect_aabb(origins, directions, aabb_flat)
+        # Set invalid_value=0 so non-intersections are easy to mask out downstream.
+        t_near, t_far = intersect_aabb(origins, directions, aabb_flat, invalid_value=0.0)
 
         return t_near, t_far
 
