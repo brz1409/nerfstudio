@@ -88,7 +88,7 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     background_color: str = "white"  # Literal["random", "last_sample", "black", "white"]
 
     # Evaluation - reduced chunk size due to 4 fields (2x memory of vanilla)
-    eval_num_rays_per_chunk: int = 1024  # reduced from default 4096
+    eval_num_rays_per_chunk: int = 512  # reduced from default 4096 (1024 still caused OOM)
 
     # Collider (same as base)
     # collider_params inherited; we optionally override far_plane from metadata in populate_modules()
@@ -429,18 +429,23 @@ class TwoMediaVanillaModel(Model):
             rs2.frustums.set_offsets(offsets)
 
         # Conditional evaluation: only evaluate the field for the current medium
-        if torch.all(seg2_is_air):
-            # All rays refracted into air: only evaluate air field
+        # Check if any rays are actually enabled for segment-2
+        if not seg2_enabled.any():
+            # All rays disabled: skip expensive field evals, use zeros (will be masked out anyway)
+            sigma2 = torch.zeros_like(rs2.frustums.starts[..., 0:1])
+            rgb2 = torch.zeros((*sigma2.shape[:-1], 3), device=sigma2.device, dtype=sigma2.dtype)
+        elif torch.all(seg2_is_air):
+            # All enabled rays refracted into air: only evaluate air field
             f2 = self.air_field_coarse.forward(rs2)
             sigma2 = f2[FieldHeadNames.DENSITY]
             rgb2 = f2[FieldHeadNames.RGB]
         elif torch.all(seg2_is_water):
-            # All rays refracted into water: only evaluate water field
+            # All enabled rays refracted into water: only evaluate water field
             f2 = self.water_field_coarse.forward(rs2)
             sigma2 = f2[FieldHeadNames.DENSITY]
             rgb2 = f2[FieldHeadNames.RGB]
         else:
-            # Mixed or disabled: evaluate both and mask (most common case for seg2)
+            # Mixed case: some rays in air, some in water (rare)
             f2_air = self.air_field_coarse.forward(rs2)
             f2_water = self.water_field_coarse.forward(rs2)
             seg2_air_mask = seg2_is_air[:, None, None]
@@ -496,18 +501,23 @@ class TwoMediaVanillaModel(Model):
             rs2_fine.frustums.set_offsets(offsets)
 
         # Conditional evaluation: only evaluate the field for the current medium
-        if torch.all(seg2_is_air):
-            # All rays refracted into air: only evaluate air field
+        # Check if any rays are actually enabled for segment-2
+        if not seg2_enabled.any():
+            # All rays disabled: skip expensive field evals, use zeros (will be masked out anyway)
+            sigma2_f = torch.zeros_like(rs2_fine.frustums.starts[..., 0:1])
+            rgb2_f = torch.zeros((*sigma2_f.shape[:-1], 3), device=sigma2_f.device, dtype=sigma2_f.dtype)
+        elif torch.all(seg2_is_air):
+            # All enabled rays refracted into air: only evaluate air field
             f2_f = self.air_field_fine.forward(rs2_fine)
             sigma2_f = f2_f[FieldHeadNames.DENSITY]
             rgb2_f = f2_f[FieldHeadNames.RGB]
         elif torch.all(seg2_is_water):
-            # All rays refracted into water: only evaluate water field
+            # All enabled rays refracted into water: only evaluate water field
             f2_f = self.water_field_fine.forward(rs2_fine)
             sigma2_f = f2_f[FieldHeadNames.DENSITY]
             rgb2_f = f2_f[FieldHeadNames.RGB]
         else:
-            # Mixed or disabled: evaluate both and mask (most common case for seg2)
+            # Mixed case: some rays in air, some in water (rare)
             f2_air_f = self.air_field_fine.forward(rs2_fine)
             f2_water_f = self.water_field_fine.forward(rs2_fine)
             seg2_air_mask = seg2_is_air[:, None, None]
