@@ -393,32 +393,60 @@ class TwoMediaVanillaModel(Model):
         seg2_is_water = going_air_to_water & seg2_enabled
 
         # ---------------------------------- Coarse pass ----------------------------------
-        # Segment-1 coarse
+        # Segment-1 coarse - conditional field evaluation for memory efficiency
         rs1 = self.sampler_uniform(rb_seg1)  # [N, S1]
         if self.temporal_distortion is not None and rs1.times is not None:
             offsets = self.temporal_distortion(rs1.frustums.get_positions(), rs1.times)
             rs1.frustums.set_offsets(offsets)
-        # Evaluate both media fields but mask via densities
-        f1_air = self.air_field_coarse.forward(rs1)
-        f1_water = self.water_field_coarse.forward(rs1)
-        # Merge densities/colors based on seg1 medium
-        seg1_air_mask = seg1_is_air[:, None, None]
-        sigma1 = torch.where(seg1_air_mask, f1_air[FieldHeadNames.DENSITY], f1_water[FieldHeadNames.DENSITY])
-        rgb1 = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air[FieldHeadNames.RGB], f1_water[FieldHeadNames.RGB])
+
+        # Conditional evaluation: only evaluate the field for the current medium
+        if torch.all(seg1_is_air):
+            # All rays in air: only evaluate air field
+            f1 = self.air_field_coarse.forward(rs1)
+            sigma1 = f1[FieldHeadNames.DENSITY]
+            rgb1 = f1[FieldHeadNames.RGB]
+        elif torch.all(seg1_is_water):
+            # All rays in water: only evaluate water field
+            f1 = self.water_field_coarse.forward(rs1)
+            sigma1 = f1[FieldHeadNames.DENSITY]
+            rgb1 = f1[FieldHeadNames.RGB]
+        else:
+            # Mixed case: evaluate both and mask (rare, safe fallback)
+            f1_air = self.air_field_coarse.forward(rs1)
+            f1_water = self.water_field_coarse.forward(rs1)
+            seg1_air_mask = seg1_is_air[:, None, None]
+            sigma1 = torch.where(seg1_air_mask, f1_air[FieldHeadNames.DENSITY], f1_water[FieldHeadNames.DENSITY])
+            rgb1 = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air[FieldHeadNames.RGB], f1_water[FieldHeadNames.RGB])
+
         w1 = rs1.get_weights(sigma1)
         rgb_coarse_1 = self.renderer_rgb(rgb=rgb1, weights=w1)
         acc_coarse_1 = self.renderer_accumulation(w1)
 
-        # Segment-2 coarse (only for enabled rays); sample anyway and zero later
+        # Segment-2 coarse - conditional field evaluation for memory efficiency
         rs2 = self.sampler_uniform(rb_seg2)
         if self.temporal_distortion is not None and rs2.times is not None:
             offsets = self.temporal_distortion(rs2.frustums.get_positions(), rs2.times)
             rs2.frustums.set_offsets(offsets)
-        f2_air = self.air_field_coarse.forward(rs2)
-        f2_water = self.water_field_coarse.forward(rs2)
-        seg2_air_mask = seg2_is_air[:, None, None]
-        sigma2 = torch.where(seg2_air_mask, f2_air[FieldHeadNames.DENSITY], f2_water[FieldHeadNames.DENSITY])
-        rgb2 = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air[FieldHeadNames.RGB], f2_water[FieldHeadNames.RGB])
+
+        # Conditional evaluation: only evaluate the field for the current medium
+        if torch.all(seg2_is_air):
+            # All rays refracted into air: only evaluate air field
+            f2 = self.air_field_coarse.forward(rs2)
+            sigma2 = f2[FieldHeadNames.DENSITY]
+            rgb2 = f2[FieldHeadNames.RGB]
+        elif torch.all(seg2_is_water):
+            # All rays refracted into water: only evaluate water field
+            f2 = self.water_field_coarse.forward(rs2)
+            sigma2 = f2[FieldHeadNames.DENSITY]
+            rgb2 = f2[FieldHeadNames.RGB]
+        else:
+            # Mixed or disabled: evaluate both and mask (most common case for seg2)
+            f2_air = self.air_field_coarse.forward(rs2)
+            f2_water = self.water_field_coarse.forward(rs2)
+            seg2_air_mask = seg2_is_air[:, None, None]
+            sigma2 = torch.where(seg2_air_mask, f2_air[FieldHeadNames.DENSITY], f2_water[FieldHeadNames.DENSITY])
+            rgb2 = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air[FieldHeadNames.RGB], f2_water[FieldHeadNames.RGB])
+
         w2 = rs2.get_weights(sigma2)
         # Scale second segment by remaining transmittance of segment-1
         T1 = (1.0 - acc_coarse_1).clamp(min=0.0, max=1.0)[..., None]
@@ -432,26 +460,60 @@ class TwoMediaVanillaModel(Model):
         depth_coarse = self._expected_depth_projected(w1, rs1, w2 * T1, rs2, origins, directions, seg2_enabled)
 
         # ---------------------------------- Fine pass ------------------------------------
+        # Segment-1 fine - conditional field evaluation for memory efficiency
         rs1_fine = self.sampler_pdf(rb_seg1, rs1, w1)
         if self.temporal_distortion is not None and rs1_fine.times is not None:
             offsets = self.temporal_distortion(rs1_fine.frustums.get_positions(), rs1_fine.times)
             rs1_fine.frustums.set_offsets(offsets)
-        f1_air_f = self.air_field_fine.forward(rs1_fine)
-        f1_water_f = self.water_field_fine.forward(rs1_fine)
-        sigma1_f = torch.where(seg1_air_mask, f1_air_f[FieldHeadNames.DENSITY], f1_water_f[FieldHeadNames.DENSITY])
-        rgb1_f = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air_f[FieldHeadNames.RGB], f1_water_f[FieldHeadNames.RGB])
+
+        # Conditional evaluation: only evaluate the field for the current medium
+        if torch.all(seg1_is_air):
+            # All rays in air: only evaluate air field
+            f1_f = self.air_field_fine.forward(rs1_fine)
+            sigma1_f = f1_f[FieldHeadNames.DENSITY]
+            rgb1_f = f1_f[FieldHeadNames.RGB]
+        elif torch.all(seg1_is_water):
+            # All rays in water: only evaluate water field
+            f1_f = self.water_field_fine.forward(rs1_fine)
+            sigma1_f = f1_f[FieldHeadNames.DENSITY]
+            rgb1_f = f1_f[FieldHeadNames.RGB]
+        else:
+            # Mixed case: evaluate both and mask (rare, safe fallback)
+            f1_air_f = self.air_field_fine.forward(rs1_fine)
+            f1_water_f = self.water_field_fine.forward(rs1_fine)
+            seg1_air_mask = seg1_is_air[:, None, None]
+            sigma1_f = torch.where(seg1_air_mask, f1_air_f[FieldHeadNames.DENSITY], f1_water_f[FieldHeadNames.DENSITY])
+            rgb1_f = torch.where(seg1_air_mask.expand(-1, -1, 3), f1_air_f[FieldHeadNames.RGB], f1_water_f[FieldHeadNames.RGB])
+
         w1_f = rs1_fine.get_weights(sigma1_f)
         rgb_fine_1 = self.renderer_rgb(rgb=rgb1_f, weights=w1_f)
         acc_fine_1 = self.renderer_accumulation(w1_f)
 
+        # Segment-2 fine - conditional field evaluation for memory efficiency
         rs2_fine = self.sampler_pdf(rb_seg2, rs2, w2)
         if self.temporal_distortion is not None and rs2_fine.times is not None:
             offsets = self.temporal_distortion(rs2_fine.frustums.get_positions(), rs2_fine.times)
             rs2_fine.frustums.set_offsets(offsets)
-        f2_air_f = self.air_field_fine.forward(rs2_fine)
-        f2_water_f = self.water_field_fine.forward(rs2_fine)
-        sigma2_f = torch.where(seg2_air_mask, f2_air_f[FieldHeadNames.DENSITY], f2_water_f[FieldHeadNames.DENSITY])
-        rgb2_f = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air_f[FieldHeadNames.RGB], f2_water_f[FieldHeadNames.RGB])
+
+        # Conditional evaluation: only evaluate the field for the current medium
+        if torch.all(seg2_is_air):
+            # All rays refracted into air: only evaluate air field
+            f2_f = self.air_field_fine.forward(rs2_fine)
+            sigma2_f = f2_f[FieldHeadNames.DENSITY]
+            rgb2_f = f2_f[FieldHeadNames.RGB]
+        elif torch.all(seg2_is_water):
+            # All rays refracted into water: only evaluate water field
+            f2_f = self.water_field_fine.forward(rs2_fine)
+            sigma2_f = f2_f[FieldHeadNames.DENSITY]
+            rgb2_f = f2_f[FieldHeadNames.RGB]
+        else:
+            # Mixed or disabled: evaluate both and mask (most common case for seg2)
+            f2_air_f = self.air_field_fine.forward(rs2_fine)
+            f2_water_f = self.water_field_fine.forward(rs2_fine)
+            seg2_air_mask = seg2_is_air[:, None, None]
+            sigma2_f = torch.where(seg2_air_mask, f2_air_f[FieldHeadNames.DENSITY], f2_water_f[FieldHeadNames.DENSITY])
+            rgb2_f = torch.where(seg2_air_mask.expand(-1, -1, 3), f2_air_f[FieldHeadNames.RGB], f2_water_f[FieldHeadNames.RGB])
+
         w2_f = rs2_fine.get_weights(sigma2_f)
         T1_f = (1.0 - acc_fine_1).clamp(min=0.0, max=1.0)[..., None]
         rgb_fine_2 = self.renderer_rgb(rgb=rgb2_f, weights=w2_f) * T1_f
