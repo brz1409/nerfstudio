@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
+import torch
 import xml.etree.ElementTree as ET
 
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import (
@@ -30,6 +31,7 @@ from nerfstudio.data.dataparsers.nerfstudio_dataparser import (
     NerfstudioDataParserConfig,
 )
 from nerfstudio.utils.io import load_from_json
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -440,6 +442,10 @@ class MetashapeWaterDataParserConfig(NerfstudioDataParserConfig):
     """Save the full marker bundle inside metadata for debugging."""
     utm_zone: int = 33
     """UTM zone used for cameras and markers (default: 33 for ETRS89 / UTM 33N)."""
+    auto_expand_scene_box_for_markers: bool = False
+    """If true, expand SceneBox to include water markers (with margin)."""
+    scene_box_margin: float = 0.2
+    """Margin added around marker AABB when auto-expanding the scene box (in model units)."""
 
 
 class MetashapeWaterDataParser(NerfstudioDataParser):
@@ -452,6 +458,25 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         water_metadata = self._compute_water_surface_metadata(outputs)
         if water_metadata is None:
             return outputs
+
+        # Optionally expand scene box to include markers (in model space)
+        if self.config.auto_expand_scene_box_for_markers and "markers_model" in water_metadata:
+            try:
+                import numpy as np
+                mm = water_metadata["markers_model"]
+                pts = np.array(list(mm.values()), dtype=float)
+                if pts.size > 0:
+                    min_v = torch.tensor(pts.min(axis=0), dtype=torch.float32)
+                    max_v = torch.tensor(pts.max(axis=0), dtype=torch.float32)
+                    margin = float(self.config.scene_box_margin)
+                    min_v = min_v - margin
+                    max_v = max_v + margin
+                    aabb = outputs.scene_box.aabb
+                    new_min = torch.minimum(aabb[0], min_v)
+                    new_max = torch.maximum(aabb[1], max_v)
+                    outputs.scene_box = SceneBox(aabb=torch.stack([new_min, new_max], dim=0))
+            except Exception:
+                pass
 
         metadata = dict(outputs.metadata)
         metadata["water_surface"] = water_metadata
@@ -494,7 +519,8 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         transforms_json: Dict,
         cameras_xml: Path,
         reference_xml: Path,
-    ) -> Tuple[Dict[str, np.ndarray], Tuple[np.ndarray, float]]:
+        markers_xml: Optional[Path],
+    ) -> Tuple[Dict[str, np.ndarray], Tuple[np.ndarray, float], np.ndarray]:
         """Transform water markers from UTM to final training space.
 
         Args:
@@ -527,7 +553,8 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             applied_transform_np = default_applied_transform()
         applied_transform_np = np.array(applied_transform_np, dtype=float)
 
-        markers_ref = _parse_markers(reference_xml, None)
+        # Use the same marker override logic as in compute_water_markers_ns_world
+        markers_ref = _parse_markers(reference_xml, markers_xml)
         if len(markers_ref) == 0:
             raise ValueError("No markers found in reference.xml")
 
@@ -563,9 +590,11 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
 
         camera_poses_np = np.array(camera_poses)
         poses_torch = torch.from_numpy(camera_poses_np.astype(np.float32))
+        # Use the same orientation override as the main dataparser if present
+        orientation_method = transforms_json.get("orientation_override", self.config.orientation_method)
         oriented_poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
             poses_torch,
-            method=self.config.orientation_method,
+            method=orientation_method,
             center_method=self.config.center_method,
         )
 
@@ -590,6 +619,12 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
 
         marker_positions = np.array(marker_positions)
         plane_model = plane_from_points(marker_positions)
+        # Standardize normal orientation to point 'up' (positive z). Flip d accordingly.
+        normal, d = plane_model
+        if normal[2] < 0:
+            normal = -normal
+            d = -d
+        plane_model = (normal, d)
 
         camera_positions_model = oriented_poses[:, :3, 3].numpy() * scale_factor
         CONSOLE.log(f"[green]Camera positions (Model Space):[/green]")
@@ -602,7 +637,7 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         CONSOLE.log(f"[green]Scale factor: {scale_factor:.6f}[/green]")
         CONSOLE.log("[cyan]═══════════════════════════════════[/cyan]")
 
-        return markers_model, plane_model
+        return markers_model, plane_model, camera_positions_model
 
     def _compute_water_surface_metadata(self, outputs) -> Optional[Dict]:
         """Compute water surface metadata using the new simplified pipeline.
@@ -650,11 +685,12 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             )
 
             # Step 2: Transform to model space (pass XMLs to refit markers directly)
-            markers_model, plane_model = self._transform_markers_to_model_space(
+            markers_model, plane_model, camera_positions_model = self._transform_markers_to_model_space(
                 markers_ns_world=water_result_ns.markers_ns_world,  # Only used for keys
                 transforms_json=transforms_json,
                 cameras_xml=cameras_xml,
                 reference_xml=reference_xml,
+                markers_xml=markers_xml,
             )
 
         except Exception as exc:  # pylint: disable=broad-except
@@ -669,6 +705,7 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             markers_model=markers_model,
             plane_ns_world=water_result_ns.plane_ns_world,
             plane_model=plane_model,
+            camera_positions_model=camera_positions_model,
         )
 
     def _build_water_surface_dict(
@@ -677,6 +714,7 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
         markers_model: Dict[str, np.ndarray],
         plane_ns_world: Optional[Tuple[np.ndarray, float]],
         plane_model: Tuple[np.ndarray, float],
+        camera_positions_model: Optional[np.ndarray] = None,
     ) -> Dict:
         """Build metadata dict from water markers and plane.
 
@@ -700,6 +738,19 @@ class MetashapeWaterDataParser(NerfstudioDataParser):
             "marker_count": len(markers_ns_world),
             "marker_labels": sorted(markers_ns_world.keys()),
         }
+
+        # Compute simple recommendation for far plane based on camera distances to plane along normal
+        try:
+            if camera_positions_model is not None and len(camera_positions_model) > 0:
+                n = plane_model[0]
+                d = float(plane_model[1])
+                signed = camera_positions_model @ n + d  # [N]
+                dists = np.abs(signed)
+                q95 = float(np.quantile(dists, 0.95))
+                recommend_far = max(2.0, 2.0 * q95)  # heuristic safety factor
+                metadata["recommendations"] = {"far_plane": recommend_far}
+        except Exception:
+            pass
 
         if plane_ns_world is not None:
             metadata["plane_world"] = {

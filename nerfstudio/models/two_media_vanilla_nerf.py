@@ -81,6 +81,12 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     """Parameters for temporal distortion instantiation."""
     use_gradient_scaling: bool = False
     """Apply distance-based gradient scaling."""
+    auto_adjust_far_from_water_plane: bool = True
+    """If true, increase collider far_plane based on water plane recommendation in metadata."""
+    water_far_multiplier: float = 1.0
+    """Multiplier applied to recommended far plane from dataparser metadata."""
+    min_air_transmittance_for_water: float = 0.0
+    """Per-ray threshold: if remaining transmittance below this, water second segment contributes zero (still sampled)."""
 
 
 class TwoMediaNeRFModel(Model):
@@ -153,6 +159,9 @@ class TwoMediaNeRFModel(Model):
         # Setup water interface geometry
         self._setup_water_interface()
 
+        # Optionally adjust collider far plane from metadata recommendation
+        self._maybe_adjust_collider_far()
+
         self._log_model_configuration()
 
     def _log_model_configuration(self) -> None:
@@ -188,6 +197,26 @@ class TwoMediaNeRFModel(Model):
             "TwoMediaNeRFModel requires water surface metadata from the dataparser. "
             "Ensure the dataparser provides `metadata['water_surface']['plane_model']`."
         )
+
+    def _maybe_adjust_collider_far(self) -> None:
+        """Optionally adjust collider far_plane based on dataparser recommendations for water plane distance."""
+        if not self.config.enable_collider or not getattr(self.config, "auto_adjust_far_from_water_plane", False):
+            return
+        if self.collider is None or not hasattr(self.collider, "far_plane"):
+            return
+        metadata = self.kwargs.get("metadata")
+        try:
+            rec = metadata.get("water_surface", {}).get("recommendations", {}) if isinstance(metadata, Mapping) else {}
+            far_rec = float(rec.get("far_plane", 0.0))
+        except Exception:
+            far_rec = 0.0
+        if far_rec <= 0.0:
+            return
+        far_target = float(far_rec) * float(self.config.water_far_multiplier)
+        current = float(getattr(self.collider, "far_plane", 0.0))
+        if far_target > current:
+            setattr(self.collider, "far_plane", far_target)
+            CONSOLE.log(f"{LOG_PREFIX} Adjusted collider far_plane from {current:.3f} → {far_target:.3f} based on water plane.")
 
     def _setup_water_from_metadata(self, water_meta: Mapping[str, Any]) -> bool:
         """Use precomputed plane parameters from dataparser metadata if available."""
@@ -531,8 +560,11 @@ class TwoMediaNeRFModel(Model):
                 CONSOLE.log(f"{LOG_PREFIX} Water sampling | " + ", ".join(stats_parts))
                 self._logged_water_sampling = True
 
+            # Optional thresholding to suppress negligible contributions
+            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
+            tmask = 1.0 if thr <= 0.0 else (air1_transmittance >= thr).float()
             # Globalize with air transmittance and mask by hits
-            weights_water2_coarse = weights_water2_coarse_pdf * air1_transmittance
+            weights_water2_coarse = weights_water2_coarse_pdf * air1_transmittance * tmask
             weights_water2_coarse = weights_water2_coarse * hits_from_above.view(-1, 1, 1)
 
         # WATER (first) for rays starting below surface; disable for others
@@ -599,7 +631,9 @@ class TwoMediaNeRFModel(Model):
             water1_transmittance = torch.clamp(
                 1.0 - weights_water1_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
             )
-            weights_air2_coarse = weights_air2_coarse_pdf * water1_transmittance
+            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
+            tmask = 1.0 if thr <= 0.0 else (water1_transmittance >= thr).float()
+            weights_air2_coarse = weights_air2_coarse_pdf * water1_transmittance * tmask
             weights_air2_coarse = weights_air2_coarse * hits_from_below.view(-1, 1, 1)
 
         # Fine sampling (air)
@@ -647,7 +681,9 @@ class TwoMediaNeRFModel(Model):
                         )
                 self._logged_water_fine_sampling = True
 
-            weights_water2_fine = weights_water2_fine * air1_transmittance_fine
+            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
+            tmask = 1.0 if thr <= 0.0 else (air1_transmittance_fine >= thr).float()
+            weights_water2_fine = weights_water2_fine * air1_transmittance_fine * tmask
             weights_water2_fine = weights_water2_fine * hits_from_above.view(-1, 1, 1)
 
         # Fine sampling (water first)
@@ -676,7 +712,9 @@ class TwoMediaNeRFModel(Model):
             water1_transmittance_fine = torch.clamp(
                 1.0 - weights_water1_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
             )
-            weights_air2_fine = weights_air2_fine * water1_transmittance_fine
+            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
+            tmask = 1.0 if thr <= 0.0 else (water1_transmittance_fine >= thr).float()
+            weights_air2_fine = weights_air2_fine * water1_transmittance_fine * tmask
             weights_air2_fine = weights_air2_fine * hits_from_below.view(-1, 1, 1)
 
         # Aggregate coarse outputs
