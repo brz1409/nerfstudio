@@ -550,8 +550,8 @@ class TwoMediaVanillaModel(Model):
         coarse_image = coarse_image.view(-1, 3)
         fine_pred = fine_pred.view(-1, 3)
         fine_image = fine_image.view(-1, 3)
-        rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
-        rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
+        rgb_loss_coarse = self.rgb_loss(coarse_pred, coarse_image)
+        rgb_loss_fine = self.rgb_loss(fine_pred, fine_image)
 
         loss_dict = {"rgb_loss_coarse": rgb_loss_coarse, "rgb_loss_fine": rgb_loss_fine}
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
