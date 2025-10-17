@@ -1,4 +1,5 @@
-# Copyright 2024 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+# Copyright 2024 the Regents of the University of California,
+# Nerfstudio Team and contributors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,23 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Two-medium extension of the vanilla NeRF model.
+"""Two-medium Vanilla NeRF (air/water) with refraction at a planar interface.
 
-Simplified approach using stratified sampling instead of occupancy grids.
-This avoids memory issues and correctly handles air/water separately.
+This model mirrors nerfstudio.models.vanilla_nerf.NeRFModel almost 1:1:
+- Same encodings, fields (here duplicated for air/water and coarse/fine),
+  samplers (Uniform + PDF), renderers (RGB/Accum/Depth) and losses/metrics.
+- Only differences:
+  * We split each camera ray into up to two segments separated by a water plane.
+  * We refract the ray direction at the interface using Snell's law.
+  * We *combine* segment contributions by multiplying the second segment's
+    weights / RGB / accumulation by the remaining transmittance of the first
+    segment, so the overall behavior matches vanilla when no interface is hit.
+  * Depth is computed as the *expected depth along the original camera ray*
+    by projecting each segment's sample midpoints back to the camera ray.
+
+The water plane parameters are expected in dataparser metadata:
+    metadata["water_surface"]["plane_model"] = {"normal": [nx,ny,nz], "d": d}
+Optionally:
+    metadata["water_surface"]["recommendations"]["far_plane"] -> float
+
+If metadata is missing, the model reduces to vanilla NeRF with the *air* fields.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections.abc import Mapping
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
-import math
 import torch
-import torch.nn.functional as F
-from torch import Tensor
+from torch import nn
 from torch.nn import Parameter
 
 from nerfstudio.cameras.rays import RayBundle, RaySamples
@@ -42,78 +55,108 @@ from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRen
 from nerfstudio.model_components.ray_samplers import PDFSampler, UniformSampler
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, misc
-from nerfstudio.utils.math import intersect_aabb
-from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils.math import intersect_aabb, safe_normalize
 
 
-LOG_PREFIX = "[TwoMediaNeRF]"
-
+# --------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------
 
 @dataclass
 class TwoMediaVanillaModelConfig(ModelConfig):
     """Two-media Vanilla NeRF with stratified sampling (no occupancy grid)."""
 
-    _target: Type = field(default_factory=lambda: TwoMediaNeRFModel)
+    _target: Type = field(default_factory=lambda: TwoMediaVanillaModel)
 
+    # Refractive indices
     air_refractive_index: float = 1.0
-    """Refractive index of air."""
     water_refractive_index: float = 1.333
-    """Refractive index of water."""
-    interface_epsilon: float = 1e-4
-    """Small offset around interface to avoid numerical issues."""
+    interface_epsilon: float = 1e-4  # offset around interface to avoid self-intersection
 
-    # Sampling parameters (matching vanilla_nerf classic)
+    # Sampling (kept identical to vanilla defaults)
     num_coarse_samples: int = 64
-    """Number of samples in coarse field evaluation per ray segment."""
     num_importance_samples: int = 128
-    """Number of samples in fine field evaluation per ray segment."""
-    eval_num_rays_per_chunk: int = 256
-    """Rays per chunk during evaluation (low for memory safety)."""
 
-    # Rendering
-    background_color: Literal["random", "last_sample", "black", "white"] = "white"
-    """Background color."""
-
-    # Optional features aligned with classic vanilla NeRF
+    # Optional temporal distortion
     enable_temporal_distortion: bool = False
-    """Specifies whether to include temporal distortion."""
     temporal_distortion_params: Dict[str, Any] = to_immutable_dict({"kind": TemporalDistortionKind.DNERF})
-    """Parameters for temporal distortion instantiation."""
+
+    # Training tricks
     use_gradient_scaling: bool = False
-    """Apply distance-based gradient scaling."""
-    auto_adjust_far_from_water_plane: bool = True
-    """If true, increase collider far_plane based on water plane recommendation in metadata."""
-    water_far_multiplier: float = 1.0
-    """Multiplier applied to recommended far plane from dataparser metadata."""
-    min_air_transmittance_for_water: float = 0.0
-    """Per-ray threshold: if remaining transmittance below this, water second segment contributes zero (still sampled)."""
+
+    # Background
+    background_color: str = "white"  # Literal["random", "last_sample", "black", "white"]
+
+    # Collider (same as base)
+    # collider_params inherited; we optionally override far_plane from metadata in populate_modules()
 
 
-class TwoMediaNeRFModel(Model):
-    """Two-medium NeRF using stratified sampling for robust memory-safe training."""
+# --------------------------------------------------------------------------------------
+# Model
+# --------------------------------------------------------------------------------------
+
+class TwoMediaVanillaModel(Model):
+    """Vanilla NeRF split into two media with a planar refractive interface."""
 
     config: TwoMediaVanillaModelConfig
 
-    def __init__(
-        self,
-        config: TwoMediaVanillaModelConfig,
-        **kwargs,
-    ) -> None:
+    def __init__(self, config: TwoMediaVanillaModelConfig, **kwargs) -> None:
+        # fields initialized in populate_modules
         self.air_field_coarse: Optional[NeRFField] = None
         self.air_field_fine: Optional[NeRFField] = None
         self.water_field_coarse: Optional[NeRFField] = None
         self.water_field_fine: Optional[NeRFField] = None
         self.temporal_distortion = None
 
-        super().__init__(
-            config=config,
-            **kwargs,
-        )
-        # internal one-time flags for subdued logging
-        self._tir_warned: bool = False
+        super().__init__(config=config, **kwargs)
+        self._tir_warned: bool = False  # single warning for total internal reflection
+
+    # ----------------------------- helpers: water plane -----------------------------
+
+    def _load_water_plane_from_metadata(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return (normal[1,3], d[1]) from dataparser metadata if available, else None."""
+        md = self.kwargs.get("metadata") if hasattr(self, "kwargs") else None
+        if not isinstance(md, dict):
+            return None
+        ws = md.get("water_surface")
+        if not isinstance(ws, dict):
+            return None
+        plane = ws.get("plane_model")
+        if not isinstance(plane, dict):
+            return None
+        n = torch.tensor(plane["normal"], dtype=torch.float32)
+        d = torch.tensor([float(plane["d"])], dtype=torch.float32)
+        n = n / (n.norm() + 1e-10)
+        # enforce upward z if desired (dataparser already does, but keep consistent)
+        if n[2] < 0:
+            n = -n
+            d = -d
+        return n[None, :], d  # [1,3], [1]
+
+    # ----------------------------- populate modules ---------------------------------
 
     def populate_modules(self) -> None:
-        """Initialize fields and samplers."""
+        """Initialize fields/samplers/renderers and water plane buffers."""
+        # Try to get water plane *before* collider creation so we can tune far_plane
+        plane = self._load_water_plane_from_metadata()
+        recommendations_far: Optional[float] = None
+        md = self.kwargs.get("metadata") if hasattr(self, "kwargs") else None
+        if isinstance(md, dict):
+            rec = md.get("water_surface", {}).get("recommendations", {})
+            if isinstance(rec, dict) and "far_plane" in rec:
+                try:
+                    recommendations_far = float(rec["far_plane"])
+                except Exception:
+                    recommendations_far = None
+
+        # If we have a recommended far plane, patch collider params *before* super call
+        if recommendations_far is not None and self.config.collider_params is not None:
+            # keep near plane, set far plane to recommendation
+            cp = dict(self.config.collider_params)
+            cp["far_plane"] = float(recommendations_far)
+            self.config.collider_params = to_immutable_dict(cp)
+
+        # create collider etc.
         super().populate_modules()
 
         # Encodings
@@ -124,690 +167,332 @@ class TwoMediaNeRFModel(Model):
             in_dim=3, num_frequencies=4, min_freq_exp=0.0, max_freq_exp=4.0, include_input=True
         )
 
-        # Four separate fields: coarse and fine for both air and water (like 2× vanilla_nerf)
+        # Two media × coarse/fine
         self.air_field_coarse = NeRFField(position_encoding=position_encoding, direction_encoding=direction_encoding)
         self.air_field_fine = NeRFField(position_encoding=position_encoding, direction_encoding=direction_encoding)
         self.water_field_coarse = NeRFField(position_encoding=position_encoding, direction_encoding=direction_encoding)
         self.water_field_fine = NeRFField(position_encoding=position_encoding, direction_encoding=direction_encoding)
 
-        # Samplers (classic NeRF approach)
+        # Samplers (parity with vanilla: set counts in Ctor, call without num_samples)
         self.sampler_uniform = UniformSampler(num_samples=self.config.num_coarse_samples)
         self.sampler_pdf = PDFSampler(num_samples=self.config.num_importance_samples)
 
         # Renderers
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer()
+        # We'll still build a DepthRenderer for convenience, but final depth comes from projection
+        self.renderer_depth = DepthRenderer(method="expected")
 
-        # Loss
+        # Losses & metrics
         self.rgb_loss = MSELoss()
-
-        # Metrics
+        from torchmetrics.functional import structural_similarity_index_measure
         from torchmetrics.image import PeakSignalNoiseRatio
         from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-        from torchmetrics.functional import structural_similarity_index_measure
 
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
         # Temporal distortion (optional)
-        self.temporal_distortion = None
         if getattr(self.config, "enable_temporal_distortion", False):
             params = dict(self.config.temporal_distortion_params)
             kind = params.pop("kind")
             self.temporal_distortion = kind.to_temporal_distortion(params)
 
-        # Setup water interface geometry
-        self._setup_water_interface()
-
-        # Optionally adjust collider far plane from metadata recommendation
-        self._maybe_adjust_collider_far()
-
-        self._log_model_configuration()
-
-    def _log_model_configuration(self) -> None:
-        """Emit a concise summary of the most relevant model parameters."""
-        cfg = self.config
-        config_parts = [
-            f"air_ior={cfg.air_refractive_index:.3f}",
-            f"water_ior={cfg.water_refractive_index:.3f}",
-            f"interface_eps={cfg.interface_epsilon:.1e}",
-            f"coarse_samples={cfg.num_coarse_samples}",
-            f"fine_samples={cfg.num_importance_samples}",
-            f"eval_chunk={cfg.eval_num_rays_per_chunk}",
-            f"background={cfg.background_color}",
-            f"grad_scaling={'on' if cfg.use_gradient_scaling else 'off'}",
-            f"temporal_distortion={'on' if self.temporal_distortion is not None else 'off'}",
-        ]
-        CONSOLE.log(f"{LOG_PREFIX} Config | " + ", ".join(config_parts))
-
-        scene_box = getattr(self, "scene_box", None)
-        if scene_box is not None:
-            CONSOLE.log(f"{LOG_PREFIX} Scene box | {scene_box.aabb.flatten().tolist()}")
-
-    def _setup_water_interface(self) -> None:
-        """Compute water surface plane in model coordinates."""
-
-        metadata = self.kwargs.get("metadata")
-        if isinstance(metadata, Mapping):
-            water_meta = metadata.get("water_surface")
-            if isinstance(water_meta, Mapping) and self._setup_water_from_metadata(water_meta):
-                return
-
-        raise ValueError(
-            "TwoMediaNeRFModel requires water surface metadata from the dataparser. "
-            "Ensure the dataparser provides `metadata['water_surface']['plane_model']`."
-        )
-
-    def _maybe_adjust_collider_far(self) -> None:
-        """Optionally adjust collider far_plane based on dataparser recommendations for water plane distance."""
-        if not self.config.enable_collider or not getattr(self.config, "auto_adjust_far_from_water_plane", False):
-            return
-        if self.collider is None or not hasattr(self.collider, "far_plane"):
-            return
-        metadata = self.kwargs.get("metadata")
-        try:
-            rec = metadata.get("water_surface", {}).get("recommendations", {}) if isinstance(metadata, Mapping) else {}
-            far_rec = float(rec.get("far_plane", 0.0))
-        except Exception:
-            far_rec = 0.0
-        if far_rec <= 0.0:
-            return
-        far_target = float(far_rec) * float(self.config.water_far_multiplier)
-        current = float(getattr(self.collider, "far_plane", 0.0))
-        if far_target > current:
-            setattr(self.collider, "far_plane", far_target)
-            CONSOLE.log(f"{LOG_PREFIX} Adjusted collider far_plane from {current:.3f} → {far_target:.3f} based on water plane.")
-
-    def _setup_water_from_metadata(self, water_meta: Mapping[str, Any]) -> bool:
-        """Use precomputed plane parameters from dataparser metadata if available."""
-        plane_model = water_meta.get("plane_model")
-        if plane_model is None:
-            return False
-
-        normal = plane_model.get("normal")
-        d_value = plane_model.get("d")
-        if normal is None or d_value is None:
-            return False
-
-        normal_tensor = torch.tensor(normal, dtype=torch.float32)
-        norm = torch.norm(normal_tensor)
-        if norm == 0:
-            CONSOLE.log(f"{LOG_PREFIX} warning: water surface metadata normal has zero length; ignoring entry.")
-            return False
-
-        normal_tensor = normal_tensor / norm
-        d = float(d_value) / float(norm)
-
-        d_tensor = torch.tensor([d], dtype=torch.float32)
-        self.register_buffer("water_plane_normal", normal_tensor.unsqueeze(0), persistent=False)
-        self.register_buffer("water_plane_d", d_tensor, persistent=False)
-        self.register_buffer("water_plane_offset", d_tensor.clone(), persistent=False)
-
-        source = water_meta.get("source", "Metadata")
-        self._log_water_surface_result(
-            f"{source} (Model)",
-            None,
-            self.water_plane_normal.squeeze(0),
-            d,
-            scale=1.0,
-        )
-        return True
-
-    def _log_water_surface_result(
-        self,
-        coord_system: str,
-        input_height: Optional[float],
-        normal_model: torch.Tensor,
-        d: float,
-        scale: float = 1.0,
-        show_header: bool = True
-    ) -> None:
-        """Log the resulting water surface position and check for issues.
-
-        Args:
-            coord_system: Name of input coordinate system
-            input_height: Input height (if applicable)
-            normal_model: Computed normal in model space
-            d: Plane equation constant
-            scale: Reference scale factor (if available)
-        """
-        if show_header:
-            header_parts = [f"source={coord_system}", f"scale={scale:.4f}"]
-            if input_height is not None:
-                header_parts.append(f"input_height={input_height:.4f}")
-            CONSOLE.log(f"{LOG_PREFIX} Water surface | " + ", ".join(header_parts))
-
-        normal_fmt = "[" + ", ".join(f"{float(v):.4f}" for v in normal_model) + "]"
-
-        if abs(normal_model[2]) > 1e-6:
-            water_z_model = -d / float(normal_model[2])
-            cosine = float(abs(normal_model[2]).clamp(-1.0, 1.0))
-            angle_deg = math.degrees(math.acos(cosine))
-
-            summary = [
-                f"model_z={water_z_model:.4f}",
-                f"tilt_deg={angle_deg:.2f}",
-                f"normal={normal_fmt}",
-                f"plane_const={d:.4f}",
-            ]
-            CONSOLE.log(f"{LOG_PREFIX} Water surface | " + ", ".join(summary))
-
-            if angle_deg > 5.0:
-                CONSOLE.log(
-                    f"{LOG_PREFIX} warning: water surface tilt {angle_deg:.1f}° exceeds 5°; verify markers or transforms."
-                )
+        # Water plane buffers (persisted)
+        if plane is not None:
+            n, d = plane
+            self.register_buffer("water_plane_normal", n, persistent=True)  # [1,3]
+            self.register_buffer("water_plane_d", d, persistent=True)       # [1]
         else:
-            CONSOLE.log(
-                f"{LOG_PREFIX} error: water surface normal is near-horizontal → plane vertical, normal={normal_fmt}, d={d:.4f}."
-            )
+            # Fallback: no water plane → behave like vanilla (always "air")
+            self.register_buffer("water_plane_normal", torch.tensor([[0.0, 0.0, 1.0]]), persistent=True)
+            self.register_buffer("water_plane_d", torch.tensor([1e6]), persistent=True)  # push plane far away
 
-    def _signed_distance_to_water(self, positions: Tensor) -> Tensor:
-        """Compute signed distance to water surface. Positive = above water (air)."""
-        # Plane equation: n·x + d = 0
-        # Signed distance: (n·x + d) / |n| (normal is already normalized)
-        return (positions @ self.water_plane_normal.T).squeeze(-1) + self.water_plane_d
+        # Cached aabb for segment-2 clipping
+        # SceneBox has aabb tensor [2,3]. Pack to [6] for intersect_aabb util.
+        aabb = torch.cat([self.scene_box.aabb[0], self.scene_box.aabb[1]], dim=0).to(torch.float32)
+        self.register_buffer("scene_aabb_flat", aabb, persistent=True)
 
-    def _compute_refraction(self, incident_dirs: Tensor, n1: float, n2: float) -> Tensor:
-        """Compute refracted ray directions at interface for a given IOR pair.
+    # ----------------------------- optimizer groups ---------------------------------
 
-        Args:
-            incident_dirs: [N,3] incident directions (normalized)
-            n1: refractive index of incident medium
-            n2: refractive index of transmitted medium
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        if any(x is None for x in [self.air_field_coarse, self.air_field_fine, self.water_field_coarse, self.water_field_fine]):
+            raise ValueError("populate_modules() must be called before get_param_groups")
+        groups = {}
+        groups["fields"] = (
+            list(self.air_field_coarse.parameters())
+            + list(self.air_field_fine.parameters())
+            + list(self.water_field_coarse.parameters())
+            + list(self.water_field_fine.parameters())
+        )
+        if self.temporal_distortion is not None:
+            groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
+        return groups
 
-        Returns:
-            Refracted unit directions. In TIR cases clamps to critical angle (warns) and returns best-effort.
+    # ----------------------------- math: plane & refraction -------------------------
+
+    @torch.no_grad()
+    def _signed_distance_to_water(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute signed distance n·x + d; positive = 'above' plane (air side)."""
+        return (x @ self.water_plane_normal[0]) + self.water_plane_d[0]
+
+    @staticmethod
+    def _snell_refract(v: torch.Tensor, n: torch.Tensor, n1: float, n2: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Refract direction v across interface with normal n (both normalized).
+        Returns (refracted_dir, tir_mask) where tir_mask=True indicates total internal reflection.
+        The normal should point from medium-2 into medium-1 for the dot products to follow
+        the standard convention; we handle orientation internally.
         """
-        normal = F.normalize(self.water_plane_normal, dim=-1)
-        incident = F.normalize(incident_dirs, dim=-1)
+        v = safe_normalize(v)
+        n = safe_normalize(n)
+        cosi = torch.sum(v * n, dim=-1, keepdim=True).clamp(-1.0, 1.0)  # cos(theta_i) with sign
+        # We want normal pointing *against* incoming ray for the refraction formula.
+        n_face = torch.where(cosi > 0, -n, n)  # flip if needed
+        cosi = torch.sum(v * n_face, dim=-1, keepdim=True)
+        eta = n1 / n2
+        k = 1.0 - eta * eta * (1.0 - cosi * cosi)
+        tir = k < 0.0
+        # Only compute where not tir
+        t = eta * v - (eta * cosi + torch.sqrt(torch.clamp(k, min=0.0))) * n_face
+        t = torch.where(tir, v, t)  # dummy output for tir
+        t = safe_normalize(t)
+        return t, tir.squeeze(-1)
 
-        # Orient normal opposite to incident to ensure cos_i >= 0
-        cos_i_raw = (incident * normal).sum(dim=-1, keepdim=True)
-        normal = torch.where(cos_i_raw > 0, -normal, normal)
-        cos_i = -(incident * normal).sum(dim=-1, keepdim=True).clamp(min=0.0)
+    # ----------------------------- raybundle utilities ------------------------------
 
-        # Snell's law
-        eta = float(n1) / float(n2)
-        sin2_t = eta**2 * (1.0 - cos_i**2)
-
-        # Total internal reflection check
-        tir_mask = sin2_t > 1.0
-        if tir_mask.any() and not getattr(self, "_tir_warned", False):
-            num_tir = int(tir_mask.sum().item())
-            total = incident.shape[0]
-            # Log only once per run to avoid noise
-            CONSOLE.log(
-                f"{LOG_PREFIX} notice: TIR observed {num_tir}/{total} rays for n1={n1:.3f}→n2={n2:.3f} (logging once)."
-            )
-            self._tir_warned = True
-            sin2_t = sin2_t.clamp(max=1.0)
-
-        cos_t = torch.sqrt(1.0 - sin2_t)
-        refracted = eta * incident + (eta * cos_i - cos_t) * normal
-
-        return F.normalize(refracted, dim=-1)
-
-    def _intersect_scene_box(self, origins: Tensor, directions: Tensor) -> Tuple[Tensor, Tensor]:
-        """Compute intersection of rays with scene bounding box.
-
-        This ensures water rays only sample within the valid scene geometry,
-        matching the behavior of vanilla NeRF where Camera automatically clips
-        rays to the scene_box via AABB intersection.
-
-        Args:
-            origins: [N, 3] ray origins
-            directions: [N, 3] ray directions (normalized)
-
-        Returns:
-            t_near: [N] distance to box entry (0 if inside box)
-            t_far: [N] distance to box exit
-        """
-        device = origins.device
-
-        # scene_box.aabb is [2, 3], but intersect_aabb expects [6] (flattened)
-        # Format: [x_min, y_min, z_min, x_max, y_max, z_max]
-        aabb_flat = self.scene_box.aabb.flatten().to(device)
-
-        # Use nerfstudio's standard AABB intersection (same as Camera uses)
-        # Set invalid_value=0 so non-intersections are easy to mask out downstream.
-        t_near, t_far = intersect_aabb(origins, directions, aabb_flat, invalid_value=0.0)
-
-        return t_near, t_far
-
-    def _apply_temporal_distortion(self, ray_samples: Optional[RaySamples]) -> None:
-        """Apply temporal distortion offsets in-place if enabled."""
-        if self.temporal_distortion is None or ray_samples is None:
-            return
-
-        offsets = None
-        if ray_samples.times is not None:
-            offsets = self.temporal_distortion(ray_samples.frustums.get_positions(), ray_samples.times)
-        ray_samples.frustums.set_offsets(offsets)
-
-    def _render_segment(
+    def _make_raybundle(
         self,
-        field: NeRFField,
-        ray_samples: RaySamples,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Render a ray segment through a field.
+        origins: torch.Tensor,
+        directions: torch.Tensor,
+        nears: torch.Tensor,
+        fars: torch.Tensor,
+        base: RayBundle,
+        pixel_area: Optional[torch.Tensor] = None,
+    ) -> RayBundle:
+        """Clone a RayBundle with new geometric params."""
+        return RayBundle(
+            origins=origins,
+            directions=directions,
+            nears=nears[..., None],
+            fars=fars[..., None],
+            pixel_area=pixel_area if pixel_area is not None else base.pixel_area,
+            camera_indices=base.camera_indices,
+            times=base.times,
+            metadata=base.metadata,
+        )
 
-        Returns:
-            weights: (num_rays, num_samples, 1) rendering weights
-            rgb: (num_rays, num_samples, 3) RGB colors
-        """
-        field_outputs = field(ray_samples)
-        if self.config.use_gradient_scaling:
-            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+    # --------------------------------------------------------------------------------
+    # Core rendering (identical structure to vanilla, but split into segments)
+    # --------------------------------------------------------------------------------
 
-        densities = field_outputs[FieldHeadNames.DENSITY]  # (num_rays, num_samples, 1)
-        rgb = field_outputs[FieldHeadNames.RGB]  # (num_rays, num_samples, 3)
+    def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        if any(x is None for x in [self.air_field_coarse, self.air_field_fine, self.water_field_coarse, self.water_field_fine]):
+            raise ValueError("populate_modules() must be called before get_outputs")
 
-        weights = ray_samples.get_weights(densities)
-
-        return weights, rgb
-
-    def _expected_depth_multi(
-        self,
-        weights: Tensor,
-        accumulation: Tensor,
-        parts: List[Tuple[Optional[RaySamples], Optional[Tensor]]],
-    ) -> Tensor:
-        """Expected depth from multiple segments.
-
-        Args:
-            weights: Combined global weights across all segments in the same order as parts
-            accumulation: Combined accumulation corresponding to weights
-            parts: List of (ray_samples, offset) pairs.
-                   For each part, t_mids = (starts+ends)/2 + offset (offset can be None → 0). If ray_samples is None
-                   or has zero samples, contributes empty mids.
-        Returns:
-            Depth tensor [N,1]
-        """
-        device = weights.device
-        dtype = weights.dtype
-        num_rays = weights.shape[0]
-        t_mids_all: List[Tensor] = []
-        for rs, offset in parts:
-            if rs is None or rs.frustums.starts.shape[-2] == 0:
-                t_mids_all.append(torch.zeros((num_rays, 0, 1), device=device, dtype=dtype))
-                continue
-            mids = (rs.frustums.starts + rs.frustums.ends) / 2.0
-            if offset is not None:
-                mids = mids + offset.view(-1, 1, 1)
-            t_mids_all.append(mids)
-        t_mids_cat = torch.cat(t_mids_all, dim=-2)
-        depth = (weights * t_mids_cat).sum(dim=-2) / (accumulation + 1e-10)
-        return depth
-
-    def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Tensor]:
-        """Forward pass with hierarchical sampling through two media."""
-
-        ray_bundle = ray_bundle.flatten()
-        num_rays = len(ray_bundle)
         device = ray_bundle.origins.device
+        dtype = ray_bundle.origins.dtype
 
-        origins = ray_bundle.origins
-        directions = F.normalize(ray_bundle.directions, dim=-1)
+        origins = ray_bundle.origins.view(-1, 3)
+        directions = safe_normalize(ray_bundle.directions.view(-1, 3))
+        num_rays = origins.shape[0]
 
-        near = ray_bundle.nears[..., 0] if ray_bundle.nears is not None else torch.zeros(num_rays, device=device)
-        far = ray_bundle.fars[..., 0] if ray_bundle.fars is not None else torch.full((num_rays,), 10.0, device=device)
+        # pull near/far: fallbacks if collider absent
+        near_default = torch.zeros(num_rays, device=device, dtype=dtype)
+        far_default = torch.full((num_rays,), 1e4, device=device, dtype=dtype)
+        near = (ray_bundle.nears[..., 0] if ray_bundle.nears is not None else near_default).view(-1)
+        far = (ray_bundle.fars[..., 0] if ray_bundle.fars is not None else far_default).view(-1)
+
+        # Signed distance at origin -> start medium
+        signed = self._signed_distance_to_water(origins)  # >0: air, <0: water
+        starts_above = signed > 0
+        starts_below = signed < 0
+
+        # Ray-plane intersection parameter along *original* ray
+        denom = torch.sum(directions * self.water_plane_normal, dim=-1)  # [N]
+        # Use large value for parallel rays (no intersection)
+        t_int = torch.where(denom.abs() > 1e-8, -signed / denom, torch.full_like(far, 1e9))
+        # Intersection is valid if within (near, far)
+        hits = (t_int > (near + 1e-6)) & (t_int < (far - 1e-6))
 
         eps = self.config.interface_epsilon
-        signed_dist = self._signed_distance_to_water(origins)
-        denom = (directions @ self.water_plane_normal.T).squeeze(-1)
+        # Prepare per-ray segment near/far for the *first* segment along original ray
+        seg1_near = near.clone()
+        seg1_far = torch.where(hits, t_int - eps, far)  # clip to interface when hit
 
-        # Interface param along original ray
-        t_int = torch.where(
-            torch.abs(denom) > 1e-6,
-            -signed_dist / denom,
-            far + 1.0,
-        )
+        # Segment-2 setup: build origins & directions by refraction at interface
+        p_int = origins + t_int.unsqueeze(-1) * directions
+        # Decide which way we're going through the interface
+        n = self.water_plane_normal.expand_as(origins)
+        going_air_to_water = starts_above & hits
+        going_water_to_air = starts_below & hits
 
-        # Assume cameras always in AIR: treat the first medium as air regardless of the plane normal sign.
-        # Use only the interface time window to decide whether to refract into water.
-        starts_above = torch.ones_like(t_int, dtype=torch.bool)
-        starts_below = torch.zeros_like(t_int, dtype=torch.bool)
-        hits_from_above = (t_int > near) & (t_int < far)
-        hits_from_below = torch.zeros_like(hits_from_above)
+        # Compute refracted directions for both cases
+        dir_refr_a2w, tir_a2w = self._snell_refract(directions, n, self.config.air_refractive_index, self.config.water_refractive_index)
+        dir_refr_w2a, tir_w2a = self._snell_refract(directions, n, self.config.water_refractive_index, self.config.air_refractive_index)
 
-        # Coarse sampling: First segment (air if starts above, otherwise water)
-        # AIR (first) for all rays (cameras assumed in AIR)
-        t_air1_far_unclamped = torch.where(hits_from_above, t_int - eps, far)
-        t_air1_far = torch.clamp(t_air1_far_unclamped, min=near + eps)
-        air1_fars = t_air1_far
+        # Choose refracted dir per ray (dummy when not used)
+        dir_refr = torch.where(going_air_to_water.unsqueeze(-1), dir_refr_a2w, directions)
+        dir_refr = torch.where(going_water_to_air.unsqueeze(-1), dir_refr_w2a, dir_refr)
 
-        air1_bundle = RayBundle(
-            origins=origins,
-            directions=directions,
-            pixel_area=ray_bundle.pixel_area,
-            camera_indices=ray_bundle.camera_indices,
-            nears=near.unsqueeze(-1),
-            fars=air1_fars.unsqueeze(-1),
-            metadata=ray_bundle.metadata,
-            times=ray_bundle.times,
-        )
-        ray_samples_air1_coarse = self.sampler_uniform(
-            air1_bundle, num_samples=self.config.num_coarse_samples
-        )
-        self._apply_temporal_distortion(ray_samples_air1_coarse)
-        weights_air1_coarse, rgb_air1_coarse = self._render_segment(
-            self.air_field_coarse, ray_samples_air1_coarse
-        )
+        tir_mask = torch.zeros_like(hits)
+        tir_mask = torch.where(going_air_to_water, tir_a2w, tir_mask)
+        tir_mask = torch.where(going_water_to_air, tir_w2a, tir_mask)
 
-        # WATER (second) for rays starting above and hitting interface
-        water2_bundle: Optional[RayBundle] = None
-        ray_samples_water2_coarse: Optional[RaySamples] = None
-        weights_water2_coarse = torch.zeros((num_rays, 0, 1), device=device)
-        weights_water2_coarse_pdf = weights_water2_coarse
-        rgb_water2_coarse = torch.zeros((num_rays, 0, 3), device=device)
+        # If TIR occurs, we disable segment-2 for that ray
+        seg2_enabled = hits & (~tir_mask)
 
-        if hits_from_above.any():
-            entry_points = origins + directions * t_int.unsqueeze(-1)
-            refracted_dirs = self._compute_refraction(directions, self.config.air_refractive_index, self.config.water_refractive_index)
-            water_origins = entry_points + refracted_dirs * eps
+        if torch.any(tir_mask) and not self._tir_warned:
+            # Single gentle warning; no spam
+            print("[TwoMediaVanillaModel] Total internal reflection encountered for some rays; disabling segment-2 on those rays.")
+            self._tir_warned = True
 
-            t_near_w2, t_far_w2 = self._intersect_scene_box(water_origins, refracted_dirs)
-            # Mask per ray: if no hit, far=0
-            t_far_w2 = torch.where(hits_from_above, t_far_w2, torch.zeros_like(t_far_w2))
+        # Segment-2 near/far in its *own* parameterization: near=0; far via AABB intersection
+        # origins for seg2: intersection point + eps along refracted dir
+        seg2_origins = p_int + eps * dir_refr
+        seg2_dirs = dir_refr
 
-            water2_bundle = RayBundle(
-                origins=water_origins,
-                directions=refracted_dirs,
-                pixel_area=ray_bundle.pixel_area,
-                camera_indices=ray_bundle.camera_indices,
-                nears=torch.where(hits_from_above, t_near_w2, torch.zeros_like(t_near_w2)).unsqueeze(-1),
-                fars=t_far_w2.unsqueeze(-1),
-                metadata=ray_bundle.metadata,
-                times=ray_bundle.times,
-            )
+        # Compute [tmin, tmax] to scene aabb along seg2 ray. Returns distances >= 0.
+        tmin2, tmax2 = intersect_aabb(seg2_origins, seg2_dirs, self.scene_aabb_flat)
+        # We want a usable finite far; if invalid_value returned, disable seg2
+        valid_aabb = tmax2.isfinite() & (tmax2 < 1e9)
+        seg2_enabled = seg2_enabled & valid_aabb
+        seg2_near = torch.zeros_like(near)
+        seg2_far = torch.where(seg2_enabled, tmax2, torch.zeros_like(tmax2))
 
-            ray_samples_water2_coarse = self.sampler_uniform(
-                water2_bundle, num_samples=self.config.num_coarse_samples
-            )
-            self._apply_temporal_distortion(ray_samples_water2_coarse)
-            weights_water2_coarse, rgb_water2_coarse = self._render_segment(
-                self.water_field_coarse, ray_samples_water2_coarse
-            )
+        # Build raybundles per segment / medium
+        # Segment-1 uses original origins/directions; Segment-2 uses refracted
+        # Note: we do *not* attempt to adjust pixel_area for segment-2. (Set to None to avoid misuse.)
+        rb_seg1 = self._make_raybundle(origins, directions, seg1_near, seg1_far, base=ray_bundle)
+        rb_seg2 = self._make_raybundle(seg2_origins, seg2_dirs, seg2_near, seg2_far, base=ray_bundle, pixel_area=None)
 
-            weights_water2_coarse_pdf = weights_water2_coarse
+        # Masks for media selection
+        seg1_is_air = starts_above
+        seg1_is_water = starts_below
+        seg2_is_air = going_water_to_air & seg2_enabled
+        seg2_is_water = going_air_to_water & seg2_enabled
 
-            air1_transmittance = torch.clamp(
-                1.0 - weights_air1_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
-            )
+        # ---------------------------------- Coarse pass ----------------------------------
+        # Segment-1 coarse
+        rs1 = self.sampler_uniform(rb_seg1)  # [N, S1]
+        if self.temporal_distortion is not None and rs1.times is not None:
+            offsets = self.temporal_distortion(rs1.frustums.get_positions(), rs1.times)
+            rs1.frustums.set_offsets(offsets)
+        # Evaluate both media fields but mask via densities
+        f1_air = self.air_field_coarse.forward(rs1)
+        f1_water = self.water_field_coarse.forward(rs1)
+        # Merge densities/colors based on seg1 medium
+        sigma1 = torch.where(seg1_is_air.unsqueeze(-1), f1_air[FieldHeadNames.DENSITY], f1_water[FieldHeadNames.DENSITY])
+        rgb1 = torch.where(seg1_is_air.unsqueeze(-1).unsqueeze(-1), f1_air[FieldHeadNames.RGB], f1_water[FieldHeadNames.RGB])
+        w1 = rs1.get_weights(sigma1)
+        rgb_coarse_1 = self.renderer_rgb(rgb=rgb1, weights=w1)
+        acc_coarse_1 = self.renderer_accumulation(w1)
 
-            if self.training and not hasattr(self, "_logged_water_sampling"):
-                valid_mask = (t_far_w2 > 0)
-                hits_int = hits_from_above
-                # Terrain: interface exists but air segment saturates before interface
-                thr = 1e-3
-                terrain_mask = torch.zeros_like(hits_int)
-                if air1_transmittance.numel() > 0:
-                    air_t = air1_transmittance.squeeze(-1).squeeze(-1)
-                    terrain_mask = hits_int & (air_t <= thr)
-                water_mask = hits_int & (~terrain_mask) & valid_mask
-                rays_hit_int = int(hits_int.sum().item())
-                rays_hit_water = int(water_mask.sum().item())
-                rays_hit_terrain = int(terrain_mask.sum().item())
+        # Segment-2 coarse (only for enabled rays); sample anyway and zero later
+        rs2 = self.sampler_uniform(rb_seg2)
+        if self.temporal_distortion is not None and rs2.times is not None:
+            offsets = self.temporal_distortion(rs2.frustums.get_positions(), rs2.times)
+            rs2.frustums.set_offsets(offsets)
+        f2_air = self.air_field_coarse.forward(rs2)
+        f2_water = self.water_field_coarse.forward(rs2)
+        sigma2 = torch.where(seg2_is_air.unsqueeze(-1), f2_air[FieldHeadNames.DENSITY], f2_water[FieldHeadNames.DENSITY])
+        rgb2 = torch.where(seg2_is_air.unsqueeze(-1).unsqueeze(-1), f2_air[FieldHeadNames.RGB], f2_water[FieldHeadNames.RGB])
+        w2 = rs2.get_weights(sigma2)
+        # Scale second segment by remaining transmittance of segment-1
+        T1 = (1.0 - acc_coarse_1).clamp(min=0.0, max=1.0)[..., None]
+        rgb_coarse_2 = self.renderer_rgb(rgb=rgb2, weights=w2) * T1
+        acc_coarse_2 = self.renderer_accumulation(w2) * T1[..., 0]
 
-                stats_parts = [
-                    f"hits_int={rays_hit_int}/{num_rays}",
-                    f"hits_water={rays_hit_water}",
-                    f"hits_terrain={rays_hit_terrain}",
-                ]
-                if valid_mask.any():
-                    remaining_vals = t_far_w2[valid_mask]
-                    stats_parts.append(f"mean_far={float(remaining_vals.mean().item()):.3f}")
-                    stats_parts.append(f"max_far={float(remaining_vals.max().item()):.3f}")
-                CONSOLE.log(f"{LOG_PREFIX} Water sampling | " + ", ".join(stats_parts))
-                self._logged_water_sampling = True
+        rgb_coarse = rgb_coarse_1 + rgb_coarse_2 * seg2_enabled.unsqueeze(-1)
+        accumulation_coarse = (acc_coarse_1 + acc_coarse_2 * seg2_enabled.float()).clamp(max=1.0)
 
-            # Optional thresholding to suppress negligible contributions
-            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
-            tmask = 1.0 if thr <= 0.0 else (air1_transmittance >= thr).float()
-            # Globalize with air transmittance and mask by hits
-            weights_water2_coarse = weights_water2_coarse_pdf * air1_transmittance * tmask
-            weights_water2_coarse = weights_water2_coarse * hits_from_above.view(-1, 1, 1)
+        # Depth coarse via projection onto original camera ray
+        depth_coarse = self._expected_depth_projected(w1, rs1, w2 * T1, rs2, origins, directions, seg2_enabled)
 
-        # WATER (first) for rays starting below surface; disable for others
-        t_water1_far_unclamped = torch.where(hits_from_below, t_int - eps, far)
-        t_water1_far = torch.where(
-            starts_below, torch.clamp(t_water1_far_unclamped, min=near + eps), torch.zeros_like(far)
-        )
-        water1_fars = t_water1_far
+        # ---------------------------------- Fine pass ------------------------------------
+        rs1_fine = self.sampler_pdf(ray_bundle=rb_seg1, ray_samples_uniform=rs1, weights=w1)
+        if self.temporal_distortion is not None and rs1_fine.times is not None:
+            offsets = self.temporal_distortion(rs1_fine.frustums.get_positions(), rs1_fine.times)
+            rs1_fine.frustums.set_offsets(offsets)
+        f1_air_f = self.air_field_fine.forward(rs1_fine)
+        f1_water_f = self.water_field_fine.forward(rs1_fine)
+        sigma1_f = torch.where(seg1_is_air.unsqueeze(-1), f1_air_f[FieldHeadNames.DENSITY], f1_water_f[FieldHeadNames.DENSITY])
+        rgb1_f = torch.where(seg1_is_air.unsqueeze(-1).unsqueeze(-1), f1_air_f[FieldHeadNames.RGB], f1_water_f[FieldHeadNames.RGB])
+        w1_f = rs1_fine.get_weights(sigma1_f)
+        rgb_fine_1 = self.renderer_rgb(rgb=rgb1_f, weights=w1_f)
+        acc_fine_1 = self.renderer_accumulation(w1_f)
 
-        water1_bundle = RayBundle(
-            origins=origins,
-            directions=directions,
-            pixel_area=ray_bundle.pixel_area,
-            camera_indices=ray_bundle.camera_indices,
-            nears=torch.where(starts_below, near, torch.zeros_like(near)).unsqueeze(-1),
-            fars=water1_fars.unsqueeze(-1),
-            metadata=ray_bundle.metadata,
-            times=ray_bundle.times,
-        )
-        ray_samples_water1_coarse = self.sampler_uniform(
-            water1_bundle, num_samples=self.config.num_coarse_samples
-        )
-        self._apply_temporal_distortion(ray_samples_water1_coarse)
-        weights_water1_coarse, rgb_water1_coarse = self._render_segment(
-            self.water_field_coarse, ray_samples_water1_coarse
-        )
+        rs2_fine = self.sampler_pdf(ray_bundle=rb_seg2, ray_samples_uniform=rs2, weights=w2)
+        if self.temporal_distortion is not None and rs2_fine.times is not None:
+            offsets = self.temporal_distortion(rs2_fine.frustums.get_positions(), rs2_fine.times)
+            rs2_fine.frustums.set_offsets(offsets)
+        f2_air_f = self.air_field_fine.forward(rs2_fine)
+        f2_water_f = self.water_field_fine.forward(rs2_fine)
+        sigma2_f = torch.where(seg2_is_air.unsqueeze(-1), f2_air_f[FieldHeadNames.DENSITY], f2_water_f[FieldHeadNames.DENSITY])
+        rgb2_f = torch.where(seg2_is_air.unsqueeze(-1).unsqueeze(-1), f2_air_f[FieldHeadNames.RGB], f2_water_f[FieldHeadNames.RGB])
+        w2_f = rs2_fine.get_weights(sigma2_f)
+        T1_f = (1.0 - acc_fine_1).clamp(min=0.0, max=1.0)[..., None]
+        rgb_fine_2 = self.renderer_rgb(rgb=rgb2_f, weights=w2_f) * T1_f
+        acc_fine_2 = self.renderer_accumulation(w2_f) * T1_f[..., 0]
 
-        # AIR (second) for rays starting below and hitting interface
-        air2_bundle: Optional[RayBundle] = None
-        ray_samples_air2_coarse: Optional[RaySamples] = None
-        weights_air2_coarse = torch.zeros((num_rays, 0, 1), device=device)
-        weights_air2_coarse_pdf = weights_air2_coarse
-        rgb_air2_coarse = torch.zeros((num_rays, 0, 3), device=device)
+        rgb_fine = rgb_fine_1 + rgb_fine_2 * seg2_enabled.unsqueeze(-1)
+        accumulation_fine = (acc_fine_1 + acc_fine_2 * seg2_enabled.float()).clamp(max=1.0)
 
-        if hits_from_below.any():
-            entry_points_b = origins + directions * t_int.unsqueeze(-1)
-            refracted_dirs_b = self._compute_refraction(directions, self.config.water_refractive_index, self.config.air_refractive_index)
-            air_origins2 = entry_points_b + refracted_dirs_b * eps
+        depth_fine = self._expected_depth_projected(w1_f, rs1_fine, w2_f * T1_f, rs2_fine, origins, directions, seg2_enabled)
 
-            t_near_a2, t_far_a2 = self._intersect_scene_box(air_origins2, refracted_dirs_b)
-            t_far_a2 = torch.where(hits_from_below, t_far_a2, torch.zeros_like(t_far_a2))
-
-            air2_bundle = RayBundle(
-                origins=air_origins2,
-                directions=refracted_dirs_b,
-                pixel_area=ray_bundle.pixel_area,
-                camera_indices=ray_bundle.camera_indices,
-                nears=torch.where(hits_from_below, t_near_a2, torch.zeros_like(t_near_a2)).unsqueeze(-1),
-                fars=t_far_a2.unsqueeze(-1),
-                metadata=ray_bundle.metadata,
-                times=ray_bundle.times,
-            )
-
-            ray_samples_air2_coarse = self.sampler_uniform(
-                air2_bundle, num_samples=self.config.num_coarse_samples
-            )
-            self._apply_temporal_distortion(ray_samples_air2_coarse)
-            weights_air2_coarse, rgb_air2_coarse = self._render_segment(
-                self.air_field_coarse, ray_samples_air2_coarse
-            )
-
-            weights_air2_coarse_pdf = weights_air2_coarse
-
-            water1_transmittance = torch.clamp(
-                1.0 - weights_water1_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
-            )
-            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
-            tmask = 1.0 if thr <= 0.0 else (water1_transmittance >= thr).float()
-            weights_air2_coarse = weights_air2_coarse_pdf * water1_transmittance * tmask
-            weights_air2_coarse = weights_air2_coarse * hits_from_below.view(-1, 1, 1)
-
-        # Fine sampling (air)
-        ray_samples_air1_fine = self.sampler_pdf(
-            air1_bundle, ray_samples_air1_coarse, weights_air1_coarse.detach()
-        )
-        self._apply_temporal_distortion(ray_samples_air1_fine)
-        weights_air1_fine, rgb_air1_fine = self._render_segment(
-            self.air_field_fine, ray_samples_air1_fine
-        )
-
-        # Fine sampling (water)
-        # Fine sampling (water second)
-        weights_water2_fine = torch.zeros((num_rays, 0, 1), device=device)
-        rgb_water2_fine = torch.zeros((num_rays, 0, 3), device=device)
-        ray_samples_water2_fine: Optional[RaySamples] = None
-
-        if hits_from_above.any() and water2_bundle is not None and ray_samples_water2_coarse is not None:
-            ray_samples_water2_fine = self.sampler_pdf(
-                water2_bundle, ray_samples_water2_coarse, weights_water2_coarse_pdf.detach()
-            )
-            self._apply_temporal_distortion(ray_samples_water2_fine)
-            weights_water2_fine, rgb_water2_fine = self._render_segment(
-                self.water_field_fine, ray_samples_water2_fine
-            )
-
-            air1_transmittance_fine = torch.clamp(
-                1.0 - weights_air1_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
-            )
-
-            if self.training and not hasattr(self, "_logged_water_fine_sampling"):
-                fine_trans_values = air1_transmittance_fine[hits_from_above].reshape(-1)
-                if fine_trans_values.numel() > 0:
-                    trans_mean = float(fine_trans_values.mean().item())
-                    trans_min = float(fine_trans_values.min().item())
-                    stats = [
-                        f"mean_trans={trans_mean:.3f}",
-                        f"min_trans={trans_min:.3e}",
-                        f"samples={fine_trans_values.numel()}",
-                    ]
-                    CONSOLE.log(f"{LOG_PREFIX} Water fine gating | " + ", ".join(stats))
-                    if trans_min < 1e-3:
-                        CONSOLE.log(
-                            f"{LOG_PREFIX} notice: fine-stage air transmittance floor {trans_min:.3e}; confirm water branch supervision."
-                        )
-                self._logged_water_fine_sampling = True
-
-            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
-            tmask = 1.0 if thr <= 0.0 else (air1_transmittance_fine >= thr).float()
-            weights_water2_fine = weights_water2_fine * air1_transmittance_fine * tmask
-            weights_water2_fine = weights_water2_fine * hits_from_above.view(-1, 1, 1)
-
-        # Fine sampling (water first)
-        ray_samples_water1_fine = self.sampler_pdf(
-            water1_bundle, ray_samples_water1_coarse, weights_water1_coarse.detach()
-        )
-        self._apply_temporal_distortion(ray_samples_water1_fine)
-        weights_water1_fine, rgb_water1_fine = self._render_segment(
-            self.water_field_fine, ray_samples_water1_fine
-        )
-
-        # Fine sampling (air second)
-        weights_air2_fine = torch.zeros((num_rays, 0, 1), device=device)
-        rgb_air2_fine = torch.zeros((num_rays, 0, 3), device=device)
-        ray_samples_air2_fine: Optional[RaySamples] = None
-
-        if hits_from_below.any() and air2_bundle is not None and ray_samples_air2_coarse is not None:
-            ray_samples_air2_fine = self.sampler_pdf(
-                air2_bundle, ray_samples_air2_coarse, weights_air2_coarse_pdf.detach()
-            )
-            self._apply_temporal_distortion(ray_samples_air2_fine)
-            weights_air2_fine, rgb_air2_fine = self._render_segment(
-                self.air_field_fine, ray_samples_air2_fine
-            )
-
-            water1_transmittance_fine = torch.clamp(
-                1.0 - weights_water1_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
-            )
-            thr = float(getattr(self.config, "min_air_transmittance_for_water", 0.0))
-            tmask = 1.0 if thr <= 0.0 else (water1_transmittance_fine >= thr).float()
-            weights_air2_fine = weights_air2_fine * water1_transmittance_fine * tmask
-            weights_air2_fine = weights_air2_fine * hits_from_below.view(-1, 1, 1)
-
-        # Aggregate coarse outputs
-        weights_coarse_all = torch.cat(
-            [
-                weights_air1_coarse,
-                weights_water2_coarse,
-                weights_water1_coarse,
-                weights_air2_coarse,
-            ],
-            dim=-2,
-        )
-        rgbs_coarse = torch.cat(
-            [
-                rgb_air1_coarse,
-                rgb_water2_coarse,
-                rgb_water1_coarse,
-                rgb_air2_coarse,
-            ],
-            dim=-2,
-        )
-        rgb_coarse = self.renderer_rgb(rgb=rgbs_coarse, weights=weights_coarse_all)
-        accumulation_coarse = self.renderer_accumulation(weights_coarse_all)
-        depth_coarse = self._expected_depth_multi(
-            weights_coarse_all,
-            accumulation_coarse,
-            [
-                (ray_samples_air1_coarse, None),
-                (ray_samples_water2_coarse, t_int),
-                (ray_samples_water1_coarse, None),
-                (ray_samples_air2_coarse, t_int),
-            ],
-        )
-
-        # Aggregate fine outputs
-        weights_fine_all = torch.cat(
-            [
-                weights_air1_fine,
-                weights_water2_fine,
-                weights_water1_fine,
-                weights_air2_fine,
-            ],
-            dim=-2,
-        )
-        rgbs_fine = torch.cat(
-            [
-                rgb_air1_fine,
-                rgb_water2_fine,
-                rgb_water1_fine,
-                rgb_air2_fine,
-            ],
-            dim=-2,
-        )
-        rgb_fine = self.renderer_rgb(rgb=rgbs_fine, weights=weights_fine_all)
-        accumulation_fine = self.renderer_accumulation(weights_fine_all)
-        depth_fine = self._expected_depth_multi(
-            weights_fine_all,
-            accumulation_fine,
-            [
-                (ray_samples_air1_fine, None),
-                (ray_samples_water2_fine, t_int),
-                (ray_samples_water1_fine, None),
-                (ray_samples_air2_fine, t_int),
-            ],
-        )
-
-        return {
+        outputs = {
             "rgb_coarse": rgb_coarse,
             "rgb_fine": rgb_fine,
             "accumulation_coarse": accumulation_coarse,
             "accumulation_fine": accumulation_fine,
             "depth_coarse": depth_coarse,
             "depth_fine": depth_fine,
-            "rgb": rgb_fine,
-            "accumulation": accumulation_fine,
-            "depth": depth_fine,
         }
+        return outputs
 
-    def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        param_groups = {}
-        if self.air_field_coarse is None or self.air_field_fine is None or self.water_field_coarse is None or self.water_field_fine is None:
-            raise ValueError("populate_modules() must be called before get_param_groups")
-        param_groups["air_field"] = list(self.air_field_coarse.parameters()) + list(self.air_field_fine.parameters())
-        param_groups["water_field"] = list(self.water_field_coarse.parameters()) + list(self.water_field_fine.parameters())
-        if self.temporal_distortion is not None:
-            param_groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
-        return param_groups
+    # ----------------------------- depth (projected) --------------------------------
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, Tensor]:
+    @staticmethod
+    def _expected_midpoint_positions(ray_samples: RaySamples) -> torch.Tensor:
+        """Return 3D midpoints of each sample: origin + dir * 0.5*(start+end)."""
+        mids = 0.5 * (ray_samples.frustums.starts + ray_samples.frustums.ends)  # [N,S,1]
+        pos = ray_samples.frustums.origins + ray_samples.frustums.directions * mids  # [N,S,3]
+        return pos
+
+    def _expected_depth_projected(
+        self,
+        weights1: torch.Tensor,
+        rs1: RaySamples,
+        weights2_scaled: torch.Tensor,
+        rs2: RaySamples,
+        cam_origins: torch.Tensor,
+        cam_dirs_unit: torch.Tensor,
+        seg2_enabled: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute expected depth along the *original* camera ray by projecting
+        the 3D midpoints from seg-1 and seg-2 onto that ray.
+        """
+        # [N,S1,3] and [N,S2,3]
+        pos1 = self._expected_midpoint_positions(rs1)
+        pos2 = self._expected_midpoint_positions(rs2)
+
+        # projection scalar t = dot(p - o, d_unit)
+        t1 = torch.sum((pos1 - cam_origins[:, None, :]) * cam_dirs_unit[:, None, :], dim=-1, keepdim=True)  # [N,S1,1]
+        t2 = torch.sum((pos2 - cam_origins[:, None, :]) * cam_dirs_unit[:, None, :], dim=-1, keepdim=True)  # [N,S2,1]
+
+        # combine weights (note: weights2 already multiplied by remaining transmittance)
+        # pad disabled seg2 with zeros
+        weights2 = weights2_scaled * seg2_enabled[:, None, None].float()
+
+        # expected depth = sum(w * t) / sum(w)
+        w_sum = (weights1.sum(dim=-2, keepdim=True) + weights2.sum(dim=-2, keepdim=True)).clamp(min=1e-10)
+        depth = (weights1 * t1).sum(dim=-2, keepdim=True) + (weights2 * t2).sum(dim=-2, keepdim=True)
+        depth = depth / w_sum  # [N,1,1]
+        return depth.squeeze(-1)  # [N,1]
+
+    # ----------------------------- loss & metrics -----------------------------------
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         device = outputs["rgb_coarse"].device
         image = batch["image"].to(device)
         coarse_pred, coarse_image = self.renderer_rgb.blend_background_for_loss_computation(
@@ -820,7 +505,6 @@ class TwoMediaNeRFModel(Model):
             pred_accumulation=outputs["accumulation_fine"],
             gt_image=image,
         )
-
         rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
         rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
 
@@ -828,18 +512,18 @@ class TwoMediaNeRFModel(Model):
         loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
         return loss_dict
 
-    def get_metrics_dict(self, outputs, batch):
-        return {}
-
     def get_image_metrics_and_images(
-        self, outputs: Dict[str, Tensor], batch: Dict[str, Tensor]
-    ) -> Tuple[Dict[str, float], Dict[str, Tensor]]:
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
         image = batch["image"].to(outputs["rgb_coarse"].device)
         image = self.renderer_rgb.blend_background(image)
+
         rgb_coarse = outputs["rgb_coarse"]
         rgb_fine = outputs["rgb_fine"]
+
         acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
         acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
+
         assert self.config.collider_params is not None
         depth_coarse = colormaps.apply_depth_colormap(
             outputs["depth_coarse"],
@@ -858,7 +542,7 @@ class TwoMediaNeRFModel(Model):
         combined_acc = torch.cat([acc_coarse, acc_fine], dim=1)
         combined_depth = torch.cat([depth_coarse, depth_fine], dim=1)
 
-        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        # metrics
         image_t = torch.moveaxis(image, -1, 0)[None, ...]
         rgb_coarse_t = torch.moveaxis(rgb_coarse, -1, 0)[None, ...]
         rgb_fine_t = torch.moveaxis(rgb_fine, -1, 0)[None, ...]
