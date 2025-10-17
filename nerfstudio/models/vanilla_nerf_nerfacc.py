@@ -39,6 +39,10 @@ from nerfstudio.utils import colormaps, misc
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils import writer as global_writer
 from nerfstudio.utils.writer import EventName as WriterEventName
+# metrics
+from torchmetrics.functional import structural_similarity_index_measure
+from torchmetrics.image import PeakSignalNoiseRatio
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
 @dataclass
@@ -149,10 +153,7 @@ class NeRFModel(Model):
         # losses
         self.rgb_loss = MSELoss()
 
-        # metrics
-        from torchmetrics.functional import structural_similarity_index_measure
-        from torchmetrics.image import PeakSignalNoiseRatio
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
 
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
