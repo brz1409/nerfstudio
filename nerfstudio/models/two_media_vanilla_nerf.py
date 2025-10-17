@@ -278,18 +278,27 @@ class TwoMediaNeRFModel(Model):
         # Signed distance: (n·x + d) / |n| (normal is already normalized)
         return (positions @ self.water_plane_normal.T).squeeze(-1) + self.water_plane_d
 
-    def _compute_refraction(self, incident_dirs: Tensor) -> Tensor:
-        """Compute refracted ray directions at water surface (air → water)."""
+    def _compute_refraction(self, incident_dirs: Tensor, n1: float, n2: float) -> Tensor:
+        """Compute refracted ray directions at interface for a given IOR pair.
+
+        Args:
+            incident_dirs: [N,3] incident directions (normalized)
+            n1: refractive index of incident medium
+            n2: refractive index of transmitted medium
+
+        Returns:
+            Refracted unit directions. In TIR cases clamps to critical angle (warns) and returns best-effort.
+        """
         normal = F.normalize(self.water_plane_normal, dim=-1)
         incident = F.normalize(incident_dirs, dim=-1)
 
-        # Ensure normal points from air to water (towards incident ray)
-        cos_i = (incident * normal).sum(dim=-1, keepdim=True)
-        normal = torch.where(cos_i > 0, -normal, normal)
+        # Orient normal opposite to incident to ensure cos_i >= 0
+        cos_i_raw = (incident * normal).sum(dim=-1, keepdim=True)
+        normal = torch.where(cos_i_raw > 0, -normal, normal)
         cos_i = -(incident * normal).sum(dim=-1, keepdim=True).clamp(min=0.0)
 
         # Snell's law
-        eta = self.config.air_refractive_index / self.config.water_refractive_index
+        eta = float(n1) / float(n2)
         sin2_t = eta**2 * (1.0 - cos_i**2)
 
         # Total internal reflection check
@@ -297,7 +306,7 @@ class TwoMediaNeRFModel(Model):
         if tir_mask.any():
             num_tir = int(tir_mask.sum().item())
             CONSOLE.log(
-                f"{LOG_PREFIX} warning: total internal reflection detected on {num_tir} rays during air→water refraction."
+                f"{LOG_PREFIX} warning: total internal reflection detected on {num_tir} rays for n1={n1:.3f}→n2={n2:.3f}."
             )
             sin2_t = sin2_t.clamp(max=1.0)
 
@@ -365,28 +374,37 @@ class TwoMediaNeRFModel(Model):
 
         return weights, rgb
 
-    def _expected_depth(
+    def _expected_depth_multi(
         self,
         weights: Tensor,
         accumulation: Tensor,
-        ray_samples_air: RaySamples,
-        ray_samples_water: Optional[RaySamples],
-        t_water: Tensor,
+        parts: List[Tuple[Optional[RaySamples], Optional[Tensor]]],
     ) -> Tensor:
-        """Compute expected depth combining air and water segments."""
+        """Expected depth from multiple segments.
 
-        t_mids_air = (ray_samples_air.frustums.starts + ray_samples_air.frustums.ends) / 2.0
-
-        if ray_samples_water is not None:
-            t_mids_water = (ray_samples_water.frustums.starts + ray_samples_water.frustums.ends) / 2.0
-            t_mids_water = t_mids_water + t_water.view(-1, 1, 1)
-        else:
-            t_mids_water = torch.zeros(
-                (weights.shape[0], 0, 1), device=weights.device, dtype=weights.dtype
-            )
-
-        t_mids_all = torch.cat([t_mids_air, t_mids_water], dim=-2)
-        depth = (weights * t_mids_all).sum(dim=-2) / (accumulation + 1e-10)
+        Args:
+            weights: Combined global weights across all segments in the same order as parts
+            accumulation: Combined accumulation corresponding to weights
+            parts: List of (ray_samples, offset) pairs.
+                   For each part, t_mids = (starts+ends)/2 + offset (offset can be None → 0). If ray_samples is None
+                   or has zero samples, contributes empty mids.
+        Returns:
+            Depth tensor [N,1]
+        """
+        device = weights.device
+        dtype = weights.dtype
+        num_rays = weights.shape[0]
+        t_mids_all: List[Tensor] = []
+        for rs, offset in parts:
+            if rs is None or rs.frustums.starts.shape[-2] == 0:
+                t_mids_all.append(torch.zeros((num_rays, 0, 1), device=device, dtype=dtype))
+                continue
+            mids = (rs.frustums.starts + rs.frustums.ends) / 2.0
+            if offset is not None:
+                mids = mids + offset.view(-1, 1, 1)
+            t_mids_all.append(mids)
+        t_mids_cat = torch.cat(t_mids_all, dim=-2)
+        depth = (weights * t_mids_cat).sum(dim=-2) / (accumulation + 1e-10)
         return depth
 
     def get_outputs(self, ray_bundle: RayBundle) -> Dict[str, Tensor]:
@@ -406,93 +424,97 @@ class TwoMediaNeRFModel(Model):
         signed_dist = self._signed_distance_to_water(origins)
         denom = (directions @ self.water_plane_normal.T).squeeze(-1)
 
-        t_water = torch.where(
+        # Interface param along original ray
+        t_int = torch.where(
             torch.abs(denom) > 1e-6,
             -signed_dist / denom,
             far + 1.0,
         )
 
         starts_above = signed_dist > eps
-        hits_water = (t_water > near) & (t_water < far) & starts_above
+        starts_below = signed_dist < -eps
+        hits_from_above = (t_int > near) & (t_int < far) & starts_above
+        hits_from_below = (t_int > near) & (t_int < far) & starts_below
 
-        # Coarse sampling (air)
-        t_air_far = torch.where(hits_water, t_water - eps, far)
-        t_air_far = torch.clamp(t_air_far, min=near + eps)
-        air_fars = torch.maximum(t_air_far, near + eps)
+        # Coarse sampling: First segment (air if starts above, otherwise water)
+        # AIR (first) for rays starting above surface; disable for others
+        t_air1_far_unclamped = torch.where(hits_from_above, t_int - eps, far)
+        t_air1_far = torch.where(
+            starts_above, torch.clamp(t_air1_far_unclamped, min=near + eps), torch.zeros_like(far)
+        )
+        air1_fars = t_air1_far
 
-        air_bundle = RayBundle(
+        air1_bundle = RayBundle(
             origins=origins,
             directions=directions,
             pixel_area=ray_bundle.pixel_area,
             camera_indices=ray_bundle.camera_indices,
-            nears=near.unsqueeze(-1),
-            fars=air_fars.unsqueeze(-1),
+            nears=torch.where(starts_above, near, torch.zeros_like(near)).unsqueeze(-1),
+            fars=air1_fars.unsqueeze(-1),
             metadata=ray_bundle.metadata,
             times=ray_bundle.times,
         )
-        ray_samples_air_coarse = self.sampler_uniform(
-            air_bundle, num_samples=self.config.num_coarse_samples
+        ray_samples_air1_coarse = self.sampler_uniform(
+            air1_bundle, num_samples=self.config.num_coarse_samples
         )
-        self._apply_temporal_distortion(ray_samples_air_coarse)
-        weights_air_coarse, rgb_air_coarse = self._render_segment(
-            self.air_field_coarse, ray_samples_air_coarse
+        self._apply_temporal_distortion(ray_samples_air1_coarse)
+        weights_air1_coarse, rgb_air1_coarse = self._render_segment(
+            self.air_field_coarse, ray_samples_air1_coarse
         )
 
-        # Coarse sampling (water)
-        water_bundle: Optional[RayBundle] = None
-        ray_samples_water_coarse: Optional[RaySamples] = None
-        weights_water_coarse = torch.zeros((num_rays, 0, 1), device=device)
-        weights_water_coarse_pdf = weights_water_coarse
-        rgb_water_coarse = torch.zeros((num_rays, 0, 3), device=device)
+        # WATER (second) for rays starting above and hitting interface
+        water2_bundle: Optional[RayBundle] = None
+        ray_samples_water2_coarse: Optional[RaySamples] = None
+        weights_water2_coarse = torch.zeros((num_rays, 0, 1), device=device)
+        weights_water2_coarse_pdf = weights_water2_coarse
+        rgb_water2_coarse = torch.zeros((num_rays, 0, 3), device=device)
 
-        if hits_water.any():
-            entry_points = origins + directions * t_water.unsqueeze(-1)
-            refracted_dirs = self._compute_refraction(directions)
+        if hits_from_above.any():
+            entry_points = origins + directions * t_int.unsqueeze(-1)
+            refracted_dirs = self._compute_refraction(directions, self.config.air_refractive_index, self.config.water_refractive_index)
             water_origins = entry_points + refracted_dirs * eps
 
-            # FIX: Use scene_box AABB intersection instead of (far - t_water)
-            # This matches vanilla NeRF behavior where Camera automatically clips rays to scene_box.
-            # Previously: remaining_dist = far - t_water caused 60%+ samples outside scene!
-            t_near_water, t_far_water = self._intersect_scene_box(water_origins, refracted_dirs)
-            remaining_dist = t_far_water
+            t_near_w2, t_far_w2 = self._intersect_scene_box(water_origins, refracted_dirs)
+            # Mask per ray: if no hit, far=0
+            t_far_w2 = torch.where(hits_from_above, t_far_w2, torch.zeros_like(t_far_w2))
 
-            water_bundle = RayBundle(
+            water2_bundle = RayBundle(
                 origins=water_origins,
                 directions=refracted_dirs,
                 pixel_area=ray_bundle.pixel_area,
                 camera_indices=ray_bundle.camera_indices,
-                nears=torch.zeros((num_rays, 1), device=device),
-                fars=remaining_dist.unsqueeze(-1),
+                nears=torch.where(hits_from_above, t_near_w2, torch.zeros_like(t_near_w2)).unsqueeze(-1),
+                fars=t_far_w2.unsqueeze(-1),
                 metadata=ray_bundle.metadata,
                 times=ray_bundle.times,
             )
 
-            ray_samples_water_coarse = self.sampler_uniform(
-                water_bundle, num_samples=self.config.num_coarse_samples
+            ray_samples_water2_coarse = self.sampler_uniform(
+                water2_bundle, num_samples=self.config.num_coarse_samples
             )
-            self._apply_temporal_distortion(ray_samples_water_coarse)
-            weights_water_coarse, rgb_water_coarse = self._render_segment(
-                self.water_field_coarse, ray_samples_water_coarse
+            self._apply_temporal_distortion(ray_samples_water2_coarse)
+            weights_water2_coarse, rgb_water2_coarse = self._render_segment(
+                self.water_field_coarse, ray_samples_water2_coarse
             )
 
-            weights_water_coarse_pdf = weights_water_coarse
+            weights_water2_coarse_pdf = weights_water2_coarse
 
-            air_transmittance = torch.clamp(
-                1.0 - weights_air_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            air1_transmittance = torch.clamp(
+                1.0 - weights_air1_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
             )
 
             if self.training and not hasattr(self, "_logged_water_sampling"):
-                valid_mask = remaining_dist > 0
+                valid_mask = (t_far_w2 > 0)
                 rays_hit = int(valid_mask.sum().item())
                 stats_parts = [f"rays_hit={rays_hit}/{num_rays}"]
                 if rays_hit > 0:
-                    remaining_vals = remaining_dist[valid_mask]
+                    remaining_vals = t_far_w2[valid_mask]
                     stats_parts.append(f"mean_far={float(remaining_vals.mean().item()):.3f}")
                     stats_parts.append(f"max_far={float(remaining_vals.max().item()):.3f}")
-                    old_method = torch.clamp(far - t_water, min=0.0)
+                    old_method = torch.clamp(far - t_int, min=0.0)
                     old_vals = old_method[valid_mask]
                     stats_parts.append(f"old_far_mean={float(old_vals.mean().item()):.3f}")
-                air_trans_values = air_transmittance[hits_water].reshape(-1)
+                air_trans_values = air1_transmittance[hits_from_above].reshape(-1)
                 if air_trans_values.numel() > 0:
                     trans_mean = float(air_trans_values.mean().item())
                     trans_min = float(air_trans_values.min().item())
@@ -508,37 +530,107 @@ class TwoMediaNeRFModel(Model):
                 CONSOLE.log(f"{LOG_PREFIX} Water sampling | " + ", ".join(stats_parts))
                 self._logged_water_sampling = True
 
-            weights_water_coarse = weights_water_coarse_pdf * air_transmittance
+            # Globalize with air transmittance and mask by hits
+            weights_water2_coarse = weights_water2_coarse_pdf * air1_transmittance
+            weights_water2_coarse = weights_water2_coarse * hits_from_above.view(-1, 1, 1)
+
+        # WATER (first) for rays starting below surface; disable for others
+        t_water1_far_unclamped = torch.where(hits_from_below, t_int - eps, far)
+        t_water1_far = torch.where(
+            starts_below, torch.clamp(t_water1_far_unclamped, min=near + eps), torch.zeros_like(far)
+        )
+        water1_fars = t_water1_far
+
+        water1_bundle = RayBundle(
+            origins=origins,
+            directions=directions,
+            pixel_area=ray_bundle.pixel_area,
+            camera_indices=ray_bundle.camera_indices,
+            nears=torch.where(starts_below, near, torch.zeros_like(near)).unsqueeze(-1),
+            fars=water1_fars.unsqueeze(-1),
+            metadata=ray_bundle.metadata,
+            times=ray_bundle.times,
+        )
+        ray_samples_water1_coarse = self.sampler_uniform(
+            water1_bundle, num_samples=self.config.num_coarse_samples
+        )
+        self._apply_temporal_distortion(ray_samples_water1_coarse)
+        weights_water1_coarse, rgb_water1_coarse = self._render_segment(
+            self.water_field_coarse, ray_samples_water1_coarse
+        )
+
+        # AIR (second) for rays starting below and hitting interface
+        air2_bundle: Optional[RayBundle] = None
+        ray_samples_air2_coarse: Optional[RaySamples] = None
+        weights_air2_coarse = torch.zeros((num_rays, 0, 1), device=device)
+        weights_air2_coarse_pdf = weights_air2_coarse
+        rgb_air2_coarse = torch.zeros((num_rays, 0, 3), device=device)
+
+        if hits_from_below.any():
+            entry_points_b = origins + directions * t_int.unsqueeze(-1)
+            refracted_dirs_b = self._compute_refraction(directions, self.config.water_refractive_index, self.config.air_refractive_index)
+            air_origins2 = entry_points_b + refracted_dirs_b * eps
+
+            t_near_a2, t_far_a2 = self._intersect_scene_box(air_origins2, refracted_dirs_b)
+            t_far_a2 = torch.where(hits_from_below, t_far_a2, torch.zeros_like(t_far_a2))
+
+            air2_bundle = RayBundle(
+                origins=air_origins2,
+                directions=refracted_dirs_b,
+                pixel_area=ray_bundle.pixel_area,
+                camera_indices=ray_bundle.camera_indices,
+                nears=torch.where(hits_from_below, t_near_a2, torch.zeros_like(t_near_a2)).unsqueeze(-1),
+                fars=t_far_a2.unsqueeze(-1),
+                metadata=ray_bundle.metadata,
+                times=ray_bundle.times,
+            )
+
+            ray_samples_air2_coarse = self.sampler_uniform(
+                air2_bundle, num_samples=self.config.num_coarse_samples
+            )
+            self._apply_temporal_distortion(ray_samples_air2_coarse)
+            weights_air2_coarse, rgb_air2_coarse = self._render_segment(
+                self.air_field_coarse, ray_samples_air2_coarse
+            )
+
+            weights_air2_coarse_pdf = weights_air2_coarse
+
+            water1_transmittance = torch.clamp(
+                1.0 - weights_water1_coarse.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            )
+            weights_air2_coarse = weights_air2_coarse_pdf * water1_transmittance
+            weights_air2_coarse = weights_air2_coarse * hits_from_below.view(-1, 1, 1)
 
         # Fine sampling (air)
-        ray_samples_air_fine = self.sampler_pdf(
-            air_bundle, ray_samples_air_coarse, weights_air_coarse.detach()
+        ray_samples_air1_fine = self.sampler_pdf(
+            air1_bundle, ray_samples_air1_coarse, weights_air1_coarse.detach()
         )
-        self._apply_temporal_distortion(ray_samples_air_fine)
-        weights_air_fine, rgb_air_fine = self._render_segment(
-            self.air_field_fine, ray_samples_air_fine
+        self._apply_temporal_distortion(ray_samples_air1_fine)
+        weights_air1_fine, rgb_air1_fine = self._render_segment(
+            self.air_field_fine, ray_samples_air1_fine
         )
 
         # Fine sampling (water)
-        weights_water_fine = torch.zeros((num_rays, 0, 1), device=device)
-        rgb_water_fine = torch.zeros((num_rays, 0, 3), device=device)
-        ray_samples_water_fine: Optional[RaySamples] = None
+        # Fine sampling (water second)
+        weights_water2_fine = torch.zeros((num_rays, 0, 1), device=device)
+        rgb_water2_fine = torch.zeros((num_rays, 0, 3), device=device)
+        ray_samples_water2_fine: Optional[RaySamples] = None
 
-        if hits_water.any() and water_bundle is not None and ray_samples_water_coarse is not None:
-            ray_samples_water_fine = self.sampler_pdf(
-                water_bundle, ray_samples_water_coarse, weights_water_coarse_pdf.detach()
+        if hits_from_above.any() and water2_bundle is not None and ray_samples_water2_coarse is not None:
+            ray_samples_water2_fine = self.sampler_pdf(
+                water2_bundle, ray_samples_water2_coarse, weights_water2_coarse_pdf.detach()
             )
-            self._apply_temporal_distortion(ray_samples_water_fine)
-            weights_water_fine, rgb_water_fine = self._render_segment(
-                self.water_field_fine, ray_samples_water_fine
+            self._apply_temporal_distortion(ray_samples_water2_fine)
+            weights_water2_fine, rgb_water2_fine = self._render_segment(
+                self.water_field_fine, ray_samples_water2_fine
             )
 
-            air_transmittance_fine = torch.clamp(
-                1.0 - weights_air_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            air1_transmittance_fine = torch.clamp(
+                1.0 - weights_air1_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
             )
 
             if self.training and not hasattr(self, "_logged_water_fine_sampling"):
-                fine_trans_values = air_transmittance_fine[hits_water].reshape(-1)
+                fine_trans_values = air1_transmittance_fine[hits_from_above].reshape(-1)
                 if fine_trans_values.numel() > 0:
                     trans_mean = float(fine_trans_values.mean().item())
                     trans_min = float(fine_trans_values.min().item())
@@ -554,32 +646,100 @@ class TwoMediaNeRFModel(Model):
                         )
                 self._logged_water_fine_sampling = True
 
-            weights_water_fine = weights_water_fine * air_transmittance_fine
+            weights_water2_fine = weights_water2_fine * air1_transmittance_fine
+            weights_water2_fine = weights_water2_fine * hits_from_above.view(-1, 1, 1)
+
+        # Fine sampling (water first)
+        ray_samples_water1_fine = self.sampler_pdf(
+            water1_bundle, ray_samples_water1_coarse, weights_water1_coarse.detach()
+        )
+        self._apply_temporal_distortion(ray_samples_water1_fine)
+        weights_water1_fine, rgb_water1_fine = self._render_segment(
+            self.water_field_fine, ray_samples_water1_fine
+        )
+
+        # Fine sampling (air second)
+        weights_air2_fine = torch.zeros((num_rays, 0, 1), device=device)
+        rgb_air2_fine = torch.zeros((num_rays, 0, 3), device=device)
+        ray_samples_air2_fine: Optional[RaySamples] = None
+
+        if hits_from_below.any() and air2_bundle is not None and ray_samples_air2_coarse is not None:
+            ray_samples_air2_fine = self.sampler_pdf(
+                air2_bundle, ray_samples_air2_coarse, weights_air2_coarse_pdf.detach()
+            )
+            self._apply_temporal_distortion(ray_samples_air2_fine)
+            weights_air2_fine, rgb_air2_fine = self._render_segment(
+                self.air_field_fine, ray_samples_air2_fine
+            )
+
+            water1_transmittance_fine = torch.clamp(
+                1.0 - weights_water1_fine.sum(dim=-2, keepdim=True), min=0.0, max=1.0
+            )
+            weights_air2_fine = weights_air2_fine * water1_transmittance_fine
+            weights_air2_fine = weights_air2_fine * hits_from_below.view(-1, 1, 1)
 
         # Aggregate coarse outputs
-        weights_coarse_all = torch.cat([weights_air_coarse, weights_water_coarse], dim=-2)
-        rgbs_coarse = torch.cat([rgb_air_coarse, rgb_water_coarse], dim=-2)
+        weights_coarse_all = torch.cat(
+            [
+                weights_air1_coarse,
+                weights_water2_coarse,
+                weights_water1_coarse,
+                weights_air2_coarse,
+            ],
+            dim=-2,
+        )
+        rgbs_coarse = torch.cat(
+            [
+                rgb_air1_coarse,
+                rgb_water2_coarse,
+                rgb_water1_coarse,
+                rgb_air2_coarse,
+            ],
+            dim=-2,
+        )
         rgb_coarse = self.renderer_rgb(rgb=rgbs_coarse, weights=weights_coarse_all)
         accumulation_coarse = self.renderer_accumulation(weights_coarse_all)
-        depth_coarse = self._expected_depth(
+        depth_coarse = self._expected_depth_multi(
             weights_coarse_all,
             accumulation_coarse,
-            ray_samples_air_coarse,
-            ray_samples_water_coarse,
-            t_water,
+            [
+                (ray_samples_air1_coarse, None),
+                (ray_samples_water2_coarse, t_int),
+                (ray_samples_water1_coarse, None),
+                (ray_samples_air2_coarse, t_int),
+            ],
         )
 
         # Aggregate fine outputs
-        weights_fine_all = torch.cat([weights_air_fine, weights_water_fine], dim=-2)
-        rgbs_fine = torch.cat([rgb_air_fine, rgb_water_fine], dim=-2)
+        weights_fine_all = torch.cat(
+            [
+                weights_air1_fine,
+                weights_water2_fine,
+                weights_water1_fine,
+                weights_air2_fine,
+            ],
+            dim=-2,
+        )
+        rgbs_fine = torch.cat(
+            [
+                rgb_air1_fine,
+                rgb_water2_fine,
+                rgb_water1_fine,
+                rgb_air2_fine,
+            ],
+            dim=-2,
+        )
         rgb_fine = self.renderer_rgb(rgb=rgbs_fine, weights=weights_fine_all)
         accumulation_fine = self.renderer_accumulation(weights_fine_all)
-        depth_fine = self._expected_depth(
+        depth_fine = self._expected_depth_multi(
             weights_fine_all,
             accumulation_fine,
-            ray_samples_air_fine,
-            ray_samples_water_fine,
-            t_water,
+            [
+                (ray_samples_air1_fine, None),
+                (ray_samples_water2_fine, t_int),
+                (ray_samples_water1_fine, None),
+                (ray_samples_air2_fine, t_int),
+            ],
         )
 
         return {
