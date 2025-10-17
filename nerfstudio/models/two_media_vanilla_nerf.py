@@ -429,7 +429,7 @@ class TwoMediaVanillaModel(Model):
         depth_coarse = self._expected_depth_projected(w1, rs1, w2 * T1, rs2, origins, directions, seg2_enabled)
 
         # ---------------------------------- Fine pass ------------------------------------
-        rs1_fine = self.sampler_pdf(ray_bundle=rb_seg1, ray_samples_uniform=rs1, weights=w1)
+        rs1_fine = self.sampler_pdf(rb_seg1, rs1, w1)
         if self.temporal_distortion is not None and rs1_fine.times is not None:
             offsets = self.temporal_distortion(rs1_fine.frustums.get_positions(), rs1_fine.times)
             rs1_fine.frustums.set_offsets(offsets)
@@ -441,7 +441,7 @@ class TwoMediaVanillaModel(Model):
         rgb_fine_1 = self.renderer_rgb(rgb=rgb1_f, weights=w1_f)
         acc_fine_1 = self.renderer_accumulation(w1_f)
 
-        rs2_fine = self.sampler_pdf(ray_bundle=rb_seg2, ray_samples_uniform=rs2, weights=w2)
+        rs2_fine = self.sampler_pdf(rb_seg2, rs2, w2)
         if self.temporal_distortion is not None and rs2_fine.times is not None:
             offsets = self.temporal_distortion(rs2_fine.frustums.get_positions(), rs2_fine.times)
             rs2_fine.frustums.set_offsets(offsets)
