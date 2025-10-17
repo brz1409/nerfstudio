@@ -562,3 +562,6 @@ class TwoMediaVanillaModel(Model):
         }
         images_dict = {"img": combined_rgb, "accumulation": combined_acc, "depth": combined_depth}
         return metrics_dict, images_dict
+
+# Backwards-compatible alias for external configs/imports
+TwoMediaNeRFModel = TwoMediaVanillaModel
