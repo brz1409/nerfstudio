@@ -87,6 +87,9 @@ class TwoMediaVanillaModelConfig(ModelConfig):
     # Background
     background_color: str = "white"  # Literal["random", "last_sample", "black", "white"]
 
+    # Evaluation - reduced chunk size due to 4 fields (2x memory of vanilla)
+    eval_num_rays_per_chunk: int = 1024  # reduced from default 4096
+
     # Collider (same as base)
     # collider_params inherited; we optionally override far_plane from metadata in populate_modules()
 
