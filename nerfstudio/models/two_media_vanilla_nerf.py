@@ -224,17 +224,27 @@ class TwoMediaVanillaModel(Model):
     # ----------------------------- optimizer groups ---------------------------------
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
-        if any(x is None for x in [self.air_field_coarse, self.air_field_fine, self.water_field_coarse, self.water_field_fine]):
+        if any(x is None for x in [
+            self.air_field_coarse, self.air_field_fine,
+            self.water_field_coarse, self.water_field_fine
+        ]):
             raise ValueError("populate_modules() must be called before get_param_groups")
-        groups = {}
-        groups["fields"] = (
-            list(self.air_field_coarse.parameters())
-            + list(self.air_field_fine.parameters())
-            + list(self.water_field_coarse.parameters())
-            + list(self.water_field_fine.parameters())
+
+        groups: Dict[str, List[Parameter]] = {}
+
+        # Gruppen-Namen passend zu deinem Optimizer-Config:
+        groups["air_field"] = (
+                list(self.air_field_coarse.parameters()) +
+                list(self.air_field_fine.parameters())
         )
+        groups["water_field"] = (
+                list(self.water_field_coarse.parameters()) +
+                list(self.water_field_fine.parameters())
+        )
+
         if self.temporal_distortion is not None:
             groups["temporal_distortion"] = list(self.temporal_distortion.parameters())
+
         return groups
 
     # ----------------------------- math: plane & refraction -------------------------
