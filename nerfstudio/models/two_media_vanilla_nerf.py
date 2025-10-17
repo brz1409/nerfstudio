@@ -513,22 +513,43 @@ class TwoMediaVanillaModel(Model):
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         device = outputs["rgb_coarse"].device
-        image = batch["image"].to(device)
+        gt_pixels = batch["image"].to(device)
+
+        def _gather_gt(gt_tensor: torch.Tensor, num_rays: int) -> torch.Tensor:
+            if gt_tensor.shape == (num_rays, 3):
+                return gt_tensor
+            indices = batch.get("indices")
+            if indices is not None:
+                indices = indices.to(gt_tensor.device)
+                if gt_tensor.dim() == 4:
+                    c = indices[:, 0]
+                    y = indices[:, 1]
+                    x = indices[:, 2]
+                    return gt_tensor[c, y, x]
+                if gt_tensor.dim() == 3:
+                    y = indices[:, 1]
+                    x = indices[:, 2]
+                    return gt_tensor[y, x]
+            return gt_tensor.reshape(-1, gt_tensor.shape[-1])[:num_rays]
+
+        num_rays = outputs["rgb_coarse"].shape[0]
+        gt_pixels = _gather_gt(gt_pixels, num_rays)
+
         coarse_pred, coarse_image = self.renderer_rgb.blend_background_for_loss_computation(
             pred_image=outputs["rgb_coarse"],
             pred_accumulation=outputs["accumulation_coarse"],
-            gt_image=image,
+            gt_image=gt_pixels,
         )
         fine_pred, fine_image = self.renderer_rgb.blend_background_for_loss_computation(
             pred_image=outputs["rgb_fine"],
             pred_accumulation=outputs["accumulation_fine"],
-            gt_image=image,
+            gt_image=gt_pixels,
         )
-        # Flatten to (num_rays, 3) to avoid broadcasting issues when GT is still HxW
-        coarse_pred = coarse_pred.reshape(-1, 3)
-        coarse_image = coarse_image.reshape(-1, 3)
-        fine_pred = fine_pred.reshape(-1, 3)
-        fine_image = fine_image.reshape(-1, 3)
+        # Ensure 2D tensors for loss computation
+        coarse_pred = coarse_pred.view(-1, 3)
+        coarse_image = coarse_image.view(-1, 3)
+        fine_pred = fine_pred.view(-1, 3)
+        fine_image = fine_image.view(-1, 3)
         rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
         rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
 
