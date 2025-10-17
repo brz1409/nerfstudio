@@ -617,8 +617,11 @@ class TwoMediaVanillaModel(Model):
         rgb_coarse = outputs["rgb_coarse"]
         rgb_fine = outputs["rgb_fine"]
 
-        acc_coarse = colormaps.apply_colormap(outputs["accumulation_coarse"])
-        acc_fine = colormaps.apply_colormap(outputs["accumulation_fine"])
+        # Add small epsilon to accumulation to avoid edge cases in colormap (e.g., all zeros at step 0)
+        acc_coarse_safe = outputs["accumulation_coarse"] + 1e-10
+        acc_fine_safe = outputs["accumulation_fine"] + 1e-10
+        acc_coarse = colormaps.apply_colormap(acc_coarse_safe)
+        acc_fine = colormaps.apply_colormap(acc_fine_safe)
 
         assert self.config.collider_params is not None
         depth_coarse = colormaps.apply_depth_colormap(
