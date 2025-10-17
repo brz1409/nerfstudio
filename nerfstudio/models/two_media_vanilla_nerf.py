@@ -154,8 +154,8 @@ class TwoMediaVanillaModel(Model):
         if isinstance(cp, dict):
             cp = dict(cp)  # make sure it's a plain, mutable dict
         else:
-            # sensible defaults (Vanilla-like)
-            cp = {"near_plane": 0.05, "far_plane": 1000.0}
+            # conservative fallback; auto-adjust below can expand it if needed
+            cp = {"near_plane": 0.5, "far_plane": 50.0}
 
         if recommendations_far is not None:
             cp["far_plane"] = float(recommendations_far)
@@ -524,6 +524,11 @@ class TwoMediaVanillaModel(Model):
             pred_accumulation=outputs["accumulation_fine"],
             gt_image=image,
         )
+        # Flatten to (num_rays, 3) to avoid broadcasting issues when GT is still HxW
+        coarse_pred = coarse_pred.reshape(-1, 3)
+        coarse_image = coarse_image.reshape(-1, 3)
+        fine_pred = fine_pred.reshape(-1, 3)
+        fine_image = fine_image.reshape(-1, 3)
         rgb_loss_coarse = self.rgb_loss(coarse_image, coarse_pred)
         rgb_loss_fine = self.rgb_loss(fine_image, fine_pred)
 
