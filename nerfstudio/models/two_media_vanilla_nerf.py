@@ -109,6 +109,8 @@ class TwoMediaNeRFModel(Model):
             config=config,
             **kwargs,
         )
+        # internal one-time flags for subdued logging
+        self._tir_warned: bool = False
 
     def populate_modules(self) -> None:
         """Initialize fields and samplers."""
@@ -332,11 +334,14 @@ class TwoMediaNeRFModel(Model):
 
         # Total internal reflection check
         tir_mask = sin2_t > 1.0
-        if tir_mask.any():
+        if tir_mask.any() and not getattr(self, "_tir_warned", False):
             num_tir = int(tir_mask.sum().item())
+            total = incident.shape[0]
+            # Log only once per run to avoid noise
             CONSOLE.log(
-                f"{LOG_PREFIX} warning: total internal reflection detected on {num_tir} rays for n1={n1:.3f}→n2={n2:.3f}."
+                f"{LOG_PREFIX} notice: TIR observed {num_tir}/{total} rays for n1={n1:.3f}→n2={n2:.3f} (logging once)."
             )
+            self._tir_warned = True
             sin2_t = sin2_t.clamp(max=1.0)
 
         cos_t = torch.sqrt(1.0 - sin2_t)
@@ -461,17 +466,17 @@ class TwoMediaNeRFModel(Model):
             far + 1.0,
         )
 
-        starts_above = signed_dist > eps
-        starts_below = signed_dist < -eps
-        hits_from_above = (t_int > near) & (t_int < far) & starts_above
-        hits_from_below = (t_int > near) & (t_int < far) & starts_below
+        # Assume cameras always in AIR: treat the first medium as air regardless of the plane normal sign.
+        # Use only the interface time window to decide whether to refract into water.
+        starts_above = torch.ones_like(t_int, dtype=torch.bool)
+        starts_below = torch.zeros_like(t_int, dtype=torch.bool)
+        hits_from_above = (t_int > near) & (t_int < far)
+        hits_from_below = torch.zeros_like(hits_from_above)
 
         # Coarse sampling: First segment (air if starts above, otherwise water)
-        # AIR (first) for rays starting above surface; disable for others
+        # AIR (first) for all rays (cameras assumed in AIR)
         t_air1_far_unclamped = torch.where(hits_from_above, t_int - eps, far)
-        t_air1_far = torch.where(
-            starts_above, torch.clamp(t_air1_far_unclamped, min=near + eps), torch.zeros_like(far)
-        )
+        t_air1_far = torch.clamp(t_air1_far_unclamped, min=near + eps)
         air1_fars = t_air1_far
 
         air1_bundle = RayBundle(
@@ -479,7 +484,7 @@ class TwoMediaNeRFModel(Model):
             directions=directions,
             pixel_area=ray_bundle.pixel_area,
             camera_indices=ray_bundle.camera_indices,
-            nears=torch.where(starts_above, near, torch.zeros_like(near)).unsqueeze(-1),
+            nears=near.unsqueeze(-1),
             fars=air1_fars.unsqueeze(-1),
             metadata=ray_bundle.metadata,
             times=ray_bundle.times,
@@ -535,28 +540,27 @@ class TwoMediaNeRFModel(Model):
 
             if self.training and not hasattr(self, "_logged_water_sampling"):
                 valid_mask = (t_far_w2 > 0)
-                rays_hit = int(valid_mask.sum().item())
-                stats_parts = [f"rays_hit={rays_hit}/{num_rays}"]
-                if rays_hit > 0:
+                hits_int = hits_from_above
+                # Terrain: interface exists but air segment saturates before interface
+                thr = 1e-3
+                terrain_mask = torch.zeros_like(hits_int)
+                if air1_transmittance.numel() > 0:
+                    air_t = air1_transmittance.squeeze(-1).squeeze(-1)
+                    terrain_mask = hits_int & (air_t <= thr)
+                water_mask = hits_int & (~terrain_mask) & valid_mask
+                rays_hit_int = int(hits_int.sum().item())
+                rays_hit_water = int(water_mask.sum().item())
+                rays_hit_terrain = int(terrain_mask.sum().item())
+
+                stats_parts = [
+                    f"hits_int={rays_hit_int}/{num_rays}",
+                    f"hits_water={rays_hit_water}",
+                    f"hits_terrain={rays_hit_terrain}",
+                ]
+                if valid_mask.any():
                     remaining_vals = t_far_w2[valid_mask]
                     stats_parts.append(f"mean_far={float(remaining_vals.mean().item()):.3f}")
                     stats_parts.append(f"max_far={float(remaining_vals.max().item()):.3f}")
-                    old_method = torch.clamp(far - t_int, min=0.0)
-                    old_vals = old_method[valid_mask]
-                    stats_parts.append(f"old_far_mean={float(old_vals.mean().item()):.3f}")
-                air_trans_values = air1_transmittance[hits_from_above].reshape(-1)
-                if air_trans_values.numel() > 0:
-                    trans_mean = float(air_trans_values.mean().item())
-                    trans_min = float(air_trans_values.min().item())
-                    stats_parts.append(f"air_trans_mean={trans_mean:.3f}")
-                    stats_parts.append(f"air_trans_min={trans_min:.3e}")
-                    if trans_min < 1e-3:
-                        CONSOLE.log(
-                            f"{LOG_PREFIX} notice: minimum air transmittance {trans_min:.3e}; water branch may receive few samples."
-                        )
-                scene_box = getattr(self, "scene_box", None)
-                if scene_box is not None:
-                    stats_parts.append(f"scene_box={scene_box.aabb.flatten().tolist()}")
                 CONSOLE.log(f"{LOG_PREFIX} Water sampling | " + ", ".join(stats_parts))
                 self._logged_water_sampling = True
 
